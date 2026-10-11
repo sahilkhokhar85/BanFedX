@@ -9,7 +9,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import UpdateOne
 from telegram import Update
 from telegram.constants import ChatMemberStatus, ChatType
-from telegram.error import Forbidden, RetryAfter, TelegramError
+from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
     ChatJoinRequestHandler,
@@ -21,6 +21,8 @@ from telegram.ext import (
 )
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)  # httpx logs would print the bot token
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("banbot")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -28,7 +30,7 @@ OWNER_IDS = {int(x) for x in os.environ.get("OWNER_IDS", "").replace(" ", "").sp
 MONGO_URI = os.environ.get("MONGO_URI") or os.environ["MONGO_URL"]
 MONGO_DB = os.environ.get("MONGO_DB", "banbot")
 SEED_FILE = os.environ.get("SEED_FILE", "ids.txt")
-SWEEP_MINUTES = int(os.environ.get("SWEEP_MINUTES", "360"))  # 0 = off
+SWEEP_MINUTES = int(os.environ.get("SWEEP_MINUTES", "0"))  # 0 = off
 LOG_CHAT_ID = os.environ.get("LOG_CHAT_ID")  # optional: chat id where bot posts logs
 
 RATE_DELAY = 0.06  # stay under Telegram's ~30 req/sec
@@ -68,6 +70,9 @@ async def post_init(app: Application):
     db = AsyncIOMotorClient(MONGO_URI)[MONGO_DB]
     BANNED.update([d["_id"] async for d in db.banned.find({}, {"_id": 1})])
     CHATS.update({d["_id"]: d.get("title", "") async for d in db.chats.find()})
+    if LOG_CHAT_ID:  # log channel is not a moderated chat
+        CHATS.pop(int(LOG_CHAT_ID), None)
+        await db.chats.delete_one({"_id": int(LOG_CHAT_ID)})
     await seed()
     log.info("Loaded %s banned ids, %s chats", len(BANNED), len(CHATS))
 
@@ -82,6 +87,11 @@ async def ban_in_chat(bot, chat_id: int, uid: int) -> bool:
             await asyncio.sleep(e.retry_after + 1)
         except Forbidden:
             log.warning("No rights in chat %s", chat_id)
+            return False
+        except BadRequest as e:
+            # unknown/never-seen user id: expected for many ids, don't spam logs
+            if "participant_id_invalid" not in str(e).lower():
+                log.warning("ban %s in %s failed: %s", uid, chat_id, e)
             return False
         except TelegramError as e:
             log.warning("ban %s in %s failed: %s", uid, chat_id, e)
@@ -136,7 +146,7 @@ async def on_my_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Auto-register a chat when the bot is made admin; remove it when the bot is removed."""
     m = update.my_chat_member
     chat = m.chat
-    if chat.type == ChatType.PRIVATE:
+    if chat.type == ChatType.PRIVATE or str(chat.id) == str(LOG_CHAT_ID):
         return
     if m.new_chat_member.status == ChatMemberStatus.ADMINISTRATOR:
         await register_chat(ctx, chat.id, chat.title)
