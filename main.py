@@ -40,7 +40,9 @@ user = None  # engine
 bot = None  # panel
 db = None
 BANNED: set[int] = set()
-MODERATED: dict[int, object] = {}  # marked chat id -> Channel entity
+CANDIDATES: dict[int, object] = {}  # every chat where the account can ban
+MODERATED: dict[int, object] = {}  # only chats YOU enabled with /add
+ENABLED: dict[int, str] = {}  # enabled chat id -> title (stored in MongoDB)
 WARNED: dict = {}
 STATE = {"last_scan": 0, "started": time.time()}
 SCAN_LOCK = None
@@ -127,7 +129,7 @@ async def seed():
 
 
 async def refresh_chats(initial: bool = False):
-    """Moderate every channel/supergroup where the user account is owner/admin with Ban rights."""
+    """CANDIDATES = chats where the account can ban. MODERATED = only the ones enabled via /add."""
     found = {}
     async for d in user.iter_dialogs():
         e = d.entity
@@ -135,17 +137,18 @@ async def refresh_chats(initial: bool = False):
             continue
         if e.creator or (e.admin_rights and e.admin_rights.ban_users):
             found[d.id] = e
-    added = [c for c in found if c not in MODERATED]
-    removed_titles = [MODERATED[c].title for c in MODERATED if c not in found]
+    new_candidates = [c for c in found if c not in CANDIDATES and c not in ENABLED]
+    lost = [(c, ENABLED[c]) for c in ENABLED if c not in found]
+    CANDIDATES.clear()
+    CANDIDATES.update(found)
     MODERATED.clear()
-    MODERATED.update(found)
+    MODERATED.update({c: e for c, e in found.items() if c in ENABLED})
     if initial:
         return
-    for c in added:
-        await send_log(f"{b('✅ Naya chat add hua:')} {b(found[c].title)} {code(c)}")
-        asyncio.create_task(scan_chat(found[c]))
-    for t in removed_titles:
-        await send_log(b(f"⚠️ Chat hata (rights chali gayi ya account nikal gaya): {t}"))
+    for c in new_candidates:
+        await send_log(f"{b('ℹ️ Naya chat mila (abhi band):')} {b(found[c].title)} {code(c)} {b('- /add se chalu karo')}")
+    for c, t in lost:
+        warn_once(("lost", c), b(f"⚠️ Chalu chat me ban rights nahi mil rahi: {t}"))
 
 
 # ======================= engine: actions =======================
@@ -352,6 +355,7 @@ def panel():
     return [
         [Button.inline("📊 Stats", b"stats"), Button.inline("📋 Chats", b"chats")],
         [Button.inline("🔍 Scan now", b"scan"), Button.inline("📄 Banned list", b"list")],
+        [Button.inline("➕ Chat add", b"add"), Button.inline("➖ Chat remove", b"remove")],
     ]
 
 
@@ -362,7 +366,9 @@ def help_text() -> str:
         "/unban <ids>",
         "/check <id>",
         "/list - last 50 banned ids",
-        "/chats - moderated chats",
+        "/add - chat chalu karo (tap karke)",
+        "/remove - chat band karo",
+        "/chats - chalu aur band chats",
         "/stats - status",
         "/scan - members + join requests abhi check",
         ".txt file bhejo = bulk ban",
@@ -391,8 +397,54 @@ async def get_stats() -> str:
 
 
 async def chats_text() -> str:
-    lines = [f"{b(e.title)} {code(c)}" for c, e in MODERATED.items()]
-    return b(f"{len(MODERATED)} chats:") + "\n" + "\n".join(lines)
+    on = [f"{b('🟢 ' + e.title)} {code(c)}" for c, e in MODERATED.items()]
+    off = [f"{b('⚪ ' + e.title)} {code(c)}" for c, e in CANDIDATES.items() if c not in ENABLED]
+    lines = [b(f"Chalu: {len(on)}")] + on
+    if off:
+        lines += [b(f"Band (/add se chalu karo): {len(off)}")] + off
+    return "\n".join(lines)
+
+
+async def show_add(event):
+    await refresh_chats(initial=True)  # pick up chats where the account just became admin
+    rows = [[Button.inline(e.title[:40], f"add:{c}".encode())] for c, e in CANDIDATES.items() if c not in ENABLED]
+    if not rows:
+        return await event.respond(
+            b("Koi naya chat nahi mila. Account ko us chat me admin banao (Ban users right), phir /add dubara."),
+            parse_mode="html",
+        )
+    await event.respond(b("Kaun sa chat chalu karna hai? Tap karo:"), parse_mode="html", buttons=rows[:50])
+
+
+async def show_remove(event):
+    rows = [[Button.inline(t[:40], f"rm:{c}".encode())] for c, t in ENABLED.items()]
+    if not rows:
+        return await event.respond(b("Koi chat chalu nahi hai."), parse_mode="html")
+    await event.respond(b("Kaun sa chat band karna hai? Tap karo:"), parse_mode="html", buttons=rows[:50])
+
+
+async def enable_chat(event, cid: int):
+    ent = CANDIDATES.get(cid)
+    if not ent:
+        return await event.respond(b("Chat nahi mila. /add dubara chalao."), parse_mode="html")
+    ENABLED[cid] = ent.title
+    await db.chats.update_one({"_id": cid}, {"$set": {"title": ent.title}}, upsert=True)
+    MODERATED[cid] = ent
+    sender = await event.get_sender()
+    await send_log(f"{b('➕ Chat chalu kiya:')} {b(ent.title)} {code(cid)} {b('by')} {label(sender)}")
+    await event.respond(b(f"✅ {ent.title} chalu. Scan shuru, result log channel me."), parse_mode="html")
+    asyncio.create_task(scan_chat(ent))
+
+
+async def disable_chat(event, cid: int):
+    title = ENABLED.pop(cid, None)
+    if title is None:
+        return await event.respond(b("Ye chat chalu nahi tha."), parse_mode="html")
+    await db.chats.delete_one({"_id": cid})
+    MODERATED.pop(cid, None)
+    sender = await event.get_sender()
+    await send_log(f"{b('➖ Chat band kiya:')} {b(title)} {code(cid)} {b('by')} {label(sender)}")
+    await event.respond(b(f"✅ {title} band. Ab us me kuch nahi hoga."), parse_mode="html")
 
 
 async def list_text() -> str:
@@ -459,6 +511,10 @@ async def on_command(event):
         await event.respond(await get_stats(), parse_mode="html")
     elif cmd == "scan":
         await start_scan(event)
+    elif cmd == "add":
+        await show_add(event)
+    elif cmd in ("remove", "rm"):
+        await show_remove(event)
 
 
 async def on_callback(event):
@@ -472,6 +528,14 @@ async def on_callback(event):
         await event.respond(await list_text(), parse_mode="html")
     elif data == "scan":
         await start_scan(event)
+    elif data == "add":
+        await show_add(event)
+    elif data == "remove":
+        await show_remove(event)
+    elif data.startswith("add:"):
+        await enable_chat(event, int(data[4:]))
+    elif data.startswith("rm:"):
+        await disable_chat(event, int(data[3:]))
 
 
 # ======================= background loops =======================
@@ -514,6 +578,7 @@ async def main():
     db = AsyncIOMotorClient(MONGO_URI)[MONGO_DB]
     BANNED.update([d["_id"] async for d in db.banned.find({}, {"_id": 1})])
     await seed()
+    ENABLED.update({d["_id"]: d.get("title", "") async for d in db.chats.find()})
 
     user = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
     await user.connect()
@@ -537,7 +602,7 @@ async def main():
     )
     bot.add_event_handler(on_callback, events.CallbackQuery(func=lambda e: e.sender_id in OWNER_IDS))
 
-    chat_lines = [b(f"• {e.title}") for e in MODERATED.values()] or [b("• (koi chat nahi - account ko admin banao)")]
+    chat_lines = [b(f"• {e.title}") for e in MODERATED.values()] or [b("• (koi chat chalu nahi - bot me /add se chalu karo)")]
     await send_log("\n".join([b("🟢 System online"), b(f"Banned IDs: {len(BANNED)}"), b(f"Chats: {len(MODERATED)}")] + chat_lines))
     log.info("System ready: %s banned ids, %s chats", len(BANNED), len(MODERATED))
 
