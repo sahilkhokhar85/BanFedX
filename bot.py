@@ -78,46 +78,92 @@ async def post_init(app: Application):
 
 
 # ---------- Telegram helpers ----------
-async def ban_in_chat(bot, chat_id: int, uid: int) -> bool:
+def fmt_user(u) -> str:
+    name = (u.full_name or "").strip()
+    uname = f" @{u.username}" if u.username else ""
+    return f"{name}{uname} [{u.id}]".strip()
+
+
+async def user_label(bot, chat_id: int, uid: int):
+    """Returns (readable label, status in chat). Falls back to just the id."""
+    try:
+        cm = await bot.get_chat_member(chat_id, uid)
+        return fmt_user(cm.user), cm.status
+    except TelegramError:
+        return f"[{uid}]", None
+
+
+async def try_ban(bot, chat_id: int, uid: int) -> str:
+    """Returns 'ok', 'invalid' (id unknown to Telegram/bot), 'forbidden' or 'fail'."""
     for _ in range(3):
         try:
             await bot.ban_chat_member(chat_id, uid, revoke_messages=False)
-            return True
+            return "ok"
         except RetryAfter as e:
             await asyncio.sleep(e.retry_after + 1)
         except Forbidden:
             log.warning("No rights in chat %s", chat_id)
-            return False
+            return "forbidden"
         except BadRequest as e:
-            # unknown/never-seen user id: expected for many ids, don't spam logs
-            if "participant_id_invalid" not in str(e).lower():
-                log.warning("ban %s in %s failed: %s", uid, chat_id, e)
-            return False
+            if "participant_id_invalid" in str(e).lower():
+                return "invalid"
+            log.warning("ban %s in %s failed: %s", uid, chat_id, e)
+            return "fail"
         except TelegramError as e:
             log.warning("ban %s in %s failed: %s", uid, chat_id, e)
-            return False
-    return False
+            return "fail"
+    return "fail"
+
+
+async def ban_in_chat(bot, chat_id: int, uid: int) -> bool:
+    return await try_ban(bot, chat_id, uid) == "ok"
 
 
 async def send_log(bot, text: str):
     if LOG_CHAT_ID:
         try:
             await bot.send_message(int(LOG_CHAT_ID), text)
-        except TelegramError:
-            pass
+        except TelegramError as e:
+            log.warning("log send failed: %s", e)
 
 
-async def ban_everywhere(bot, uids, chat_ids=None) -> tuple[int, int]:
-    """Ban every uid in every chat. Banning works even if the user is not a member (pre-ban)."""
+async def send_log_lines(bot, header: str, lines: list):
+    if not lines:
+        return
+    chunk = header
+    for line in lines:
+        if len(chunk) + len(line) + 1 > 3800:
+            await send_log(bot, chunk)
+            chunk = header + " (contd.)"
+        chunk += "\n" + line
+    await send_log(bot, chunk)
+
+
+async def ban_everywhere(bot, uids, chat_ids=None, notify=False) -> tuple[int, int]:
+    """Ban every uid in every chat (works even if the user is not a member).
+    notify=True posts the list of banned users per chat to the log channel."""
     chat_ids = list(CHATS) if chat_ids is None else chat_ids
     ok = fail = 0
+    invalid = set()  # ids Telegram can't resolve: don't retry them in other chats this run
     for chat_id in chat_ids:
+        lines = []
         for uid in uids:
-            if await ban_in_chat(bot, chat_id, uid):
+            if uid in invalid:
+                fail += 1
+                continue
+            res = await try_ban(bot, chat_id, uid)
+            if res == "ok":
                 ok += 1
+                if notify:
+                    label, _ = await user_label(bot, chat_id, uid)
+                    lines.append("• " + label)
             else:
                 fail += 1
+                if res == "invalid":
+                    invalid.add(uid)
             await asyncio.sleep(RATE_DELAY)
+        if notify:
+            await send_log_lines(bot, f"🚫 Banned in {CHATS.get(chat_id, chat_id)}:", lines)
     return ok, fail
 
 
@@ -131,7 +177,7 @@ async def on_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except TelegramError as e:
             log.warning("decline failed: %s", e)
         await ban_in_chat(ctx.bot, req.chat.id, uid)
-        await send_log(ctx.bot, f"🚫 Join request declined + banned: {uid} in {req.chat.title}")
+        await send_log(ctx.bot, f"🚫 Join request declined + banned: {fmt_user(req.from_user)} in {req.chat.title}")
 
 
 async def on_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -139,7 +185,7 @@ async def on_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = cm.new_chat_member.user.id
     if uid in BANNED and cm.new_chat_member.status in (ChatMemberStatus.MEMBER, ChatMemberStatus.RESTRICTED):
         if await ban_in_chat(ctx.bot, cm.chat.id, uid):
-            await send_log(ctx.bot, f"🚫 Banned on join: {uid} in {cm.chat.title}")
+            await send_log(ctx.bot, f"🚫 Banned on join: {fmt_user(cm.new_chat_member.user)} in {cm.chat.title}")
 
 
 async def on_my_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -160,7 +206,7 @@ async def register_chat(ctx, chat_id: int, title: str):
     await db.chats.update_one({"_id": chat_id}, {"$set": {"title": title}}, upsert=True)
 
     async def job():
-        ok, fail = await ban_everywhere(ctx.bot, list(BANNED), [chat_id])
+        ok, fail = await ban_everywhere(ctx.bot, list(BANNED), [chat_id], notify=True)
         await send_log(ctx.bot, f"✅ Added to {title}. Synced {len(BANNED)} bans (ok={ok}, fail={fail})")
 
     ctx.application.create_task(job())
@@ -174,15 +220,15 @@ async def on_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     targets = []
     if msg.from_user and msg.from_user.id in BANNED:
-        targets.append(msg.from_user.id)
-    targets += [u.id for u in (msg.new_chat_members or []) if u.id in BANNED]
-    for uid in targets:
-        await ban_in_chat(ctx.bot, chat.id, uid)
+        targets.append(msg.from_user)
+    targets += [u for u in (msg.new_chat_members or []) if u.id in BANNED]
+    for u in targets:
+        await ban_in_chat(ctx.bot, chat.id, u.id)
         try:
             await msg.delete()
         except TelegramError:
             pass
-        await send_log(ctx.bot, f"🚫 Banned (seen active): {uid} in {chat.title}")
+        await send_log(ctx.bot, f"🚫 Banned (seen active): {fmt_user(u)} in {chat.title}")
 
 
 # ---------- Owner commands (private chat only) ----------
@@ -220,7 +266,7 @@ async def _do_ban(update, ctx, ids):
     await update.message.reply_text(f"{len(ids)} id(s) add. {len(CHATS)} chats me ban ho rahe hain...")
 
     async def job():
-        ok, fail = await ban_everywhere(ctx.bot, ids)
+        ok, fail = await ban_everywhere(ctx.bot, ids, notify=True)
         await update.message.reply_text(f"✅ Done. ok={ok}, fail={fail}")
 
     ctx.application.create_task(job())
@@ -247,12 +293,17 @@ async def cmd_unban(update, ctx):
     await db.banned.delete_many({"_id": {"$in": ids}})
     BANNED.difference_update(ids)
     for chat_id in list(CHATS):
+        lines = []
         for uid in ids:
+            label, status = await user_label(ctx.bot, chat_id, uid)
             try:
                 await ctx.bot.unban_chat_member(chat_id, uid, only_if_banned=True)
+                if status == ChatMemberStatus.BANNED:
+                    lines.append("• " + label)
             except TelegramError:
                 pass
             await asyncio.sleep(RATE_DELAY)
+        await send_log_lines(ctx.bot, f"✅ Unbanned in {CHATS.get(chat_id, chat_id)}:", lines)
     await update.message.reply_text(f"{len(ids)} id(s) unban + list se hata di.")
 
 
