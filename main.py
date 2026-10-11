@@ -43,6 +43,7 @@ BANNED: set[int] = set()
 CANDIDATES: dict[int, object] = {}  # every chat where the account can ban
 MODERATED: dict[int, object] = {}  # only chats YOU enabled with /add
 ENABLED: dict[int, str] = {}  # enabled chat id -> title (stored in MongoDB)
+HIDDEN: set[int] = set()  # chats you removed from the lists forever (stored in MongoDB)
 WARNED: dict = {}
 STATE = {"last_scan": 0, "started": time.time()}
 SCAN_LOCK = None
@@ -137,7 +138,6 @@ async def refresh_chats(initial: bool = False):
             continue
         if e.creator or (e.admin_rights and e.admin_rights.ban_users):
             found[d.id] = e
-    new_candidates = [c for c in found if c not in CANDIDATES and c not in ENABLED]
     lost = [(c, ENABLED[c]) for c in ENABLED if c not in found]
     CANDIDATES.clear()
     CANDIDATES.update(found)
@@ -145,8 +145,6 @@ async def refresh_chats(initial: bool = False):
     MODERATED.update({c: e for c, e in found.items() if c in ENABLED})
     if initial:
         return
-    for c in new_candidates:
-        await send_log(f"{b('ℹ️ Naya chat mila (abhi band):')} {b(found[c].title)} {code(c)} {b('- /add se chalu karo')}")
     for c, t in lost:
         warn_once(("lost", c), b(f"⚠️ Chalu chat me ban rights nahi mil rahi: {t}"))
 
@@ -355,7 +353,6 @@ def panel():
     return [
         [Button.inline("📊 Stats", b"stats"), Button.inline("📋 Chats", b"chats")],
         [Button.inline("🔍 Scan now", b"scan"), Button.inline("📄 Banned list", b"list")],
-        [Button.inline("➕ Chat add", b"add"), Button.inline("➖ Chat remove", b"remove")],
     ]
 
 
@@ -366,9 +363,7 @@ def help_text() -> str:
         "/unban <ids>",
         "/check <id>",
         "/list - last 50 banned ids",
-        "/add - chat chalu karo (tap karke)",
-        "/remove - chat band karo",
-        "/chats - chalu aur band chats",
+        "/chats - chats dekho, jodo ya hatao",
         "/stats - status",
         "/scan - members + join requests abhi check",
         ".txt file bhejo = bulk ban",
@@ -397,23 +392,45 @@ async def get_stats() -> str:
 
 
 async def chats_text() -> str:
-    on = [f"{b('🟢 ' + e.title)} {code(c)}" for c, e in MODERATED.items()]
-    off = [f"{b('⚪ ' + e.title)} {code(c)}" for c, e in CANDIDATES.items() if c not in ENABLED]
-    lines = [b(f"Chalu: {len(on)}")] + on
-    if off:
-        lines += [b(f"Band (/add se chalu karo): {len(off)}")] + off
+    if not MODERATED:
+        return b("Abhi koi chat chalu nahi hai. '➕ Chat jodo' dabao.")
+    lines = [b(f"🟢 Chalu chats: {len(MODERATED)}")] + [f"{b(e.title)} {code(c)}" for c, e in MODERATED.items()]
     return "\n".join(lines)
+
+
+async def send_chats(event):
+    buttons = [[Button.inline("➕ Chat jodo", b"add"), Button.inline("➖ Chat hatao", b"remove")]]
+    await event.respond(await chats_text(), parse_mode="html", buttons=buttons)
 
 
 async def show_add(event):
     await refresh_chats(initial=True)  # pick up chats where the account just became admin
-    rows = [[Button.inline(e.title[:40], f"add:{c}".encode())] for c, e in CANDIDATES.items() if c not in ENABLED]
-    if not rows:
-        return await event.respond(
-            b("Koi naya chat nahi mila. Account ko us chat me admin banao (Ban users right), phir /add dubara."),
-            parse_mode="html",
-        )
-    await event.respond(b("Kaun sa chat chalu karna hai? Tap karo:"), parse_mode="html", buttons=rows[:50])
+    rows = [
+        [Button.inline(e.title[:35], f"add:{c}".encode()), Button.inline("🗑", f"hide:{c}".encode())]
+        for c, e in CANDIDATES.items()
+        if c not in ENABLED and c not in HIDDEN
+    ]
+    if rows:
+        text = b("Naam dabao = chalu karo. 🗑 dabao = hamesha ke liye list se hatao:")
+    else:
+        text = b("Koi chat nahi bacha. Naye chat ke liye account ko wahan admin banao (Ban users right), phir dobara dabao.")
+    if HIDDEN:
+        rows.append([Button.inline("♻️ Chhupe chats wapas dikhao", b"unhide")])
+    await event.respond(text, parse_mode="html", buttons=rows[:50] or None)
+
+
+async def hide_chat(event, cid: int):
+    ent = CANDIDATES.get(cid)
+    title = ent.title if ent else str(cid)
+    HIDDEN.add(cid)
+    await db.hidden.update_one({"_id": cid}, {"$set": {"title": title}}, upsert=True)
+    await event.respond(b(f"🗑 {title} hamesha ke liye hata diya. Ab list me nahi dikhega."), parse_mode="html")
+
+
+async def unhide_all(event):
+    HIDDEN.clear()
+    await db.hidden.delete_many({})
+    await event.respond(b("♻️ Chhupe chats wapas aa gaye. /chats me 'Chat jodo' dabao."), parse_mode="html")
 
 
 async def show_remove(event):
@@ -506,7 +523,7 @@ async def on_command(event):
     elif cmd == "list":
         await event.respond(await list_text(), parse_mode="html")
     elif cmd == "chats":
-        await event.respond(await chats_text(), parse_mode="html")
+        await send_chats(event)
     elif cmd == "stats":
         await event.respond(await get_stats(), parse_mode="html")
     elif cmd == "scan":
@@ -523,7 +540,7 @@ async def on_callback(event):
     if data == "stats":
         await event.respond(await get_stats(), parse_mode="html")
     elif data == "chats":
-        await event.respond(await chats_text(), parse_mode="html")
+        await send_chats(event)
     elif data == "list":
         await event.respond(await list_text(), parse_mode="html")
     elif data == "scan":
@@ -536,6 +553,10 @@ async def on_callback(event):
         await enable_chat(event, int(data[4:]))
     elif data.startswith("rm:"):
         await disable_chat(event, int(data[3:]))
+    elif data.startswith("hide:"):
+        await hide_chat(event, int(data[5:]))
+    elif data == "unhide":
+        await unhide_all(event)
 
 
 # ======================= background loops =======================
@@ -579,6 +600,7 @@ async def main():
     BANNED.update([d["_id"] async for d in db.banned.find({}, {"_id": 1})])
     await seed()
     ENABLED.update({d["_id"]: d.get("title", "") async for d in db.chats.find()})
+    HIDDEN.update([d["_id"] async for d in db.hidden.find({}, {"_id": 1})])
 
     user = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
     await user.connect()
