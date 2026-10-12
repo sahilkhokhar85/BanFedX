@@ -45,6 +45,7 @@ CANDIDATES: dict[int, object] = {}  # every chat where the account can ban
 MODERATED: dict[int, object] = {}  # only chats YOU enabled with /add
 ENABLED: dict[int, str] = {}  # enabled chat id -> title (stored in MongoDB)
 HIDDEN: set[int] = set()  # chats you removed from the lists forever (stored in MongoDB)
+EXEMPT: dict[int, set[int]] = {}  # chat id -> users on the ban list who must NOT be banned in that chat
 WARNED: dict = {}
 STATE = {"last_scan": 0, "started": time.time()}
 SCAN_LOCK = None
@@ -71,6 +72,11 @@ def label(u) -> str:
     uname = f" @{u.username}" if getattr(u, "username", None) else ""
     text = f"{name}{uname}".strip()
     return f"{b(text)} {code(u.id)}" if text else code(u.id)
+
+
+def is_target(entity, uid: int) -> bool:
+    """True if this user must be banned in this chat: on the ban list and not exempted for this chat."""
+    return uid in BANNED and uid not in EXEMPT.get(utils.get_peer_id(entity), ())
 
 
 def parse_ids(text: str) -> list[int]:
@@ -221,7 +227,7 @@ async def process_pending(entity) -> int:
         return 0
     n = 0
     for u in users:
-        if u.id in BANNED:
+        if is_target(entity, u.id):
             await decline(entity, u)
             await ban(entity, u)
             n += 1
@@ -240,7 +246,7 @@ async def scan_chat(entity):
     try:
         async for u in user.iter_participants(entity):
             checked += 1
-            if u.id in BANNED:
+            if is_target(entity, u.id):
                 if await ban(entity, u) == "ok":
                     banned += 1
                     lines.append("• " + label(u))
@@ -279,6 +285,8 @@ async def ban_ids(ids):
     for ent in list(MODERATED.values()):
         lines = []
         for uid in ids:
+            if not is_target(ent, uid):
+                continue  # exempted in this chat
             if uid in invalid:
                 fail += 1
                 continue
@@ -335,7 +343,7 @@ async def on_chat_action(event):
     if not ent:
         return
     for u in await event.get_users():
-        if u.id in BANNED and await ban(ent, u) == "ok":
+        if is_target(ent, u.id) and await ban(ent, u) == "ok":
             await bump("bans")
             await send_log(f"{b('🚫 Banned on join:')} {label(u)} {b('in ' + ent.title)}")
 
@@ -396,6 +404,7 @@ async def menu(event):
         [Button.inline("🚫 Ban", b"ban"), Button.inline("✅ Unban", b"unban")],
         [Button.inline("📋 Chats", b"chats"), Button.inline("📊 Stats", b"stats")],
         [Button.inline("🔍 Scan now", b"scan"), Button.inline("📄 Banned list", b"list")],
+        [Button.inline("🛡 Exceptions", b"exc")],
     ]
     await show(event, text, buttons)
 
@@ -408,6 +417,7 @@ def stats_text(s: dict) -> str:
         ("Total bans", str(s.get("bans", 0))),
         ("Declined requests", str(s.get("declined", 0))),
         ("Unbans", str(s.get("unbans", 0))),
+        ("Exceptions", str(sum(len(v) for v in EXEMPT.values()))),
         ("Last scan", last_scan_text()),
         ("Uptime", f"{up // 60}h {up % 60}m"),
     ]
@@ -565,20 +575,132 @@ async def do_unban(event, ids):
     asyncio.create_task(unban_ids(ids))
 
 
+# ---------- exceptions: users on the ban list who must NOT be banned in a specific chat ----------
+async def unban_in_chat(ent, ids):
+    idset = set(ids)
+    lines = []
+    try:
+        async for u in user.iter_participants(ent, filter=types.ChannelParticipantsKicked):
+            if u.id in idset:
+                await user(functions.channels.EditBannedRequest(ent, u, NO_BAN))
+                lines.append("• " + label(u))
+                await asyncio.sleep(RATE_DELAY)
+    except Exception as e:
+        warn_once(("unban-chat", ent.id), b(f"⚠️ {ent.title}: could not read banned list ({type(e).__name__})"))
+    await send_log_lines(b(f"🔓 Exception - unbanned in {ent.title}:"), lines)
+
+
+async def exc_chats_screen(event):
+    if not MODERATED:
+        return await show(event, b("No active chats yet. Add a chat first."), [MENU_BTN])
+    rows = [
+        [Button.inline(f"{e.title[:28]} ({len(EXEMPT.get(c, ()))})", f"exc:{c}".encode())]
+        for c, e in MODERATED.items()
+    ]
+    rows.append(MENU_BTN)
+    text = "\n".join(
+        [
+            "🛡 " + b("Exceptions"),
+            b("Users on the ban list who should NOT be banned in a specific chat."),
+            b("Pick a chat:"),
+        ]
+    )
+    await show(event, text, rows[:50])
+
+
+async def exc_chat_screen(event, cid: int, note: str = ""):
+    ent = MODERATED.get(cid)
+    if not ent:
+        return await show(event, b("This chat is not active."), [[Button.inline("⬅️ Back", b"exc")], MENU_BTN])
+    ids = sorted(EXEMPT.get(cid, ()))
+    lines = [note, ""] if note else []
+    lines.append("🛡 " + b(f"Exceptions - {ent.title}"))
+    if ids:
+        lines.append(b(f"{len(ids)} user(s) are NOT banned here:"))
+        lines += [code(i) for i in ids[:40]]
+    else:
+        lines.append(b("No exceptions. Everyone on the ban list is banned here."))
+    first = [Button.inline("➕ Add exception", f"excadd:{cid}".encode())]
+    if ids:
+        first.append(Button.inline("➖ Remove", f"excrm:{cid}".encode()))
+    buttons = [first, [Button.inline("⬅️ Back", b"exc"), Button.inline("⬅️ Menu", b"menu")]]
+    await show(event, "\n".join(lines), buttons)
+
+
+async def exc_remove_screen(event, cid: int):
+    ids = sorted(EXEMPT.get(cid, ()))
+    rows = [[Button.inline(f"🗑 {i}", f"excdel:{cid}:{i}".encode())] for i in ids[:50]]
+    rows.append([Button.inline("⬅️ Back", f"exc:{cid}".encode())])
+    text = b("Tap an ID to remove its exception (the user will be banned in this chat again):")
+    await show(event, text, rows)
+
+
+async def ask_exc(event, cid: int):
+    ent = MODERATED.get(cid)
+    if not ent:
+        return await show(event, b("This chat is not active."), [MENU_BTN])
+    AWAIT[event.sender_id] = f"exc:{cid}"
+    text = b(f"Send the user ID(s) that must NOT be banned in {ent.title} (one or many). A .txt file works too.")
+    await show(event, text, [[Button.inline("❌ Cancel", f"exc:{cid}".encode())]])
+
+
+async def do_exempt(event, cid: int, ids):
+    ent = MODERATED.get(cid)
+    if not ent:
+        return await show(event, b("This chat is not active."), [MENU_BTN])
+    if not ids:
+        buttons = [[Button.inline("🔁 Try again", f"excadd:{cid}".encode())], [Button.inline("⬅️ Back", f"exc:{cid}".encode())]]
+        return await show(event, b("No valid user ID found. Send numeric IDs like 123456789."), buttons)
+    EXEMPT.setdefault(cid, set()).update(ids)
+    await db.exempt.bulk_write(
+        [UpdateOne({"_id": f"{cid}:{i}"}, {"$set": {"chat": cid, "user": i}}, upsert=True) for i in ids]
+    )
+    sender = await event.get_sender()
+    head = f"{b('🛡 Exception added:')} {label(sender)} {b('- ' + str(len(ids)) + ' ID(s) in ' + ent.title)}"
+    await send_log(head + "\n" + " ".join(code(i) for i in ids[:20]))
+    asyncio.create_task(unban_in_chat(ent, ids))  # lift any existing ban in this chat
+    note = b(f"✅ {len(ids)} ID(s) will NOT be banned in this chat. Existing bans here are being lifted.")
+    await exc_chat_screen(event, cid, note=note)
+
+
+async def del_exception(event, cid: int, uid: int):
+    EXEMPT.get(cid, set()).discard(uid)
+    await db.exempt.delete_one({"_id": f"{cid}:{uid}"})
+    ent = MODERATED.get(cid)
+    title = ent.title if ent else str(cid)
+    sender = await event.get_sender()
+    await send_log(f"{b('🛡 Exception removed:')} {label(sender)} {b('-')} {code(uid)} {b('in ' + title)}")
+    if ent and uid in BANNED:
+        if await ban(ent, uid) == "ok":
+            await bump("bans")
+            await send_log(f"{b('🚫 Banned again (exception removed):')} {code(uid)} {b('in ' + title)}")
+        else:
+            asyncio.create_task(scan_chat(ent))  # not resolvable by id: find them among members
+    await exc_chat_screen(event, cid, note=b("✅ Exception removed. This user is banned in this chat again."))
+
+
+async def dispatch_ids(event, mode, ids):
+    if mode == "unban":
+        return await do_unban(event, ids)
+    if mode and mode.startswith("exc:"):
+        return await do_exempt(event, int(mode[4:]), ids)
+    return await do_ban(event, ids)
+
+
 async def on_command(event):
     mode = AWAIT.pop(event.sender_id, None)
     f = event.file
     if f and f.name and f.name.lower().endswith((".txt", ".csv")) and (f.size or 0) < 5_000_000:
         data = (await event.message.download_media(file=bytes)).decode("utf-8", errors="ignore")
         ids = parse_ids(data)
-        return await (do_unban(event, ids) if mode == "unban" else do_ban(event, ids))
+        return await dispatch_ids(event, mode, ids)
 
     text = event.raw_text or ""
     m = re.match(r"^/(\w+)(?:@\w+)?\s*(.*)$", text, re.S)
     if not m:  # plain message: if we asked for ids, use them, otherwise just show the menu
-        if mode in ("ban", "unban"):
+        if mode:
             ids = parse_ids(text)
-            return await (do_unban(event, ids) if mode == "unban" else do_ban(event, ids))
+            return await dispatch_ids(event, mode, ids)
         return await menu(event)
 
     cmd, ids = m.group(1).lower(), parse_ids(m.group(2))
@@ -588,7 +710,11 @@ async def on_command(event):
         await (do_unban(event, ids) if ids else ask_ids(event, "unban"))
     elif cmd == "check" and ids:
         msg = "is in the BANNED list" if ids[0] in BANNED else "is not in the list"
-        await show(event, f"{code(ids[0])} {b(msg)}", [MENU_BTN])
+        text = f"{code(ids[0])} {b(msg)}"
+        ex = [MODERATED[c].title for c, s in EXEMPT.items() if ids[0] in s and c in MODERATED]
+        if ex:
+            text += "\n" + b("Not banned in: " + ", ".join(ex))
+        await show(event, text, [MENU_BTN])
     elif cmd == "list":
         await list_screen(event)
     elif cmd == "chats":
@@ -597,6 +723,8 @@ async def on_command(event):
         await stats_screen(event)
     elif cmd == "export":
         await export_list(event)
+    elif cmd in ("exceptions", "exc"):
+        await exc_chats_screen(event)
     elif cmd == "scan":
         await start_scan(event)
     elif cmd == "add":
@@ -631,6 +759,17 @@ async def on_callback(event):
         await remove_screen(event)
     elif data == "unhide":
         await unhide_all(event)
+    elif data == "exc":
+        await exc_chats_screen(event)
+    elif data.startswith("exc:"):
+        await exc_chat_screen(event, int(data[4:]))
+    elif data.startswith("excadd:"):
+        await ask_exc(event, int(data[7:]))
+    elif data.startswith("excrm:"):
+        await exc_remove_screen(event, int(data[6:]))
+    elif data.startswith("excdel:"):
+        _, c, u = data.split(":")
+        await del_exception(event, int(c), int(u))
     elif data.startswith("add:"):
         await enable_chat(event, int(data[4:]))
     elif data.startswith("rm:"):
@@ -681,6 +820,8 @@ async def main():
     await seed()
     ENABLED.update({d["_id"]: d.get("title", "") async for d in db.chats.find()})
     HIDDEN.update([d["_id"] async for d in db.hidden.find({}, {"_id": 1})])
+    async for d in db.exempt.find():
+        EXEMPT.setdefault(d["chat"], set()).add(d["user"])
 
     user = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
     await user.connect()
