@@ -362,14 +362,33 @@ async def show(event, text: str, buttons=None):
         pass
 
 
+def table(rows: list) -> str:
+    """Aligned two-column block (monospace) for dashboards."""
+    w = max(len(k) for k, _ in rows)
+    return "<pre>" + "\n".join(f"{esc(k).ljust(w)}  {esc(v)}" for k, v in rows) + "</pre>"
+
+
+def last_scan_text() -> str:
+    if SCAN_LOCK is not None and SCAN_LOCK.locked():
+        return "running now..."
+    return ago(STATE["last_scan"])
+
+
 async def menu(event):
     s = await db.meta.find_one({"_id": "stats"}) or {}
+    rows = [
+        ("Active chats", str(len(MODERATED))),
+        ("Banned IDs", str(len(BANNED))),
+        ("Total bans", str(s.get("bans", 0))),
+        ("Last scan", last_scan_text()),
+    ]
     text = "\n".join(
         [
-            b("🛡 Haters Ban System"),
-            b("🟢 Running - works automatically"),
-            b(f"👥 Chats: {len(MODERATED)}    🚫 Banned IDs: {len(BANNED)}"),
-            b(f"Total bans: {s.get('bans', 0)}    Last scan: {ago(STATE['last_scan'])}"),
+            "🛡 " + b("Haters Ban System"),
+            "🟢 " + b("Running") + " · fully automatic",
+            "",
+            table(rows),
+            "<i>Tap a button below</i>",
         ]
     )
     buttons = [
@@ -382,17 +401,16 @@ async def menu(event):
 
 def stats_text(s: dict) -> str:
     up = int(time.time() - STATE["started"]) // 60
-    lines = [
-        "📊 Stats",
-        f"Banned list: {len(BANNED)} IDs",
-        f"Active chats: {len(MODERATED)}",
-        f"Total bans: {s.get('bans', 0)}",
-        f"Join requests declined: {s.get('declined', 0)}",
-        f"Unban: {s.get('unbans', 0)}",
-        f"Last scan: {ago(STATE['last_scan'])}",
-        f"Uptime: {up} min",
+    rows = [
+        ("Active chats", str(len(MODERATED))),
+        ("Banned IDs", str(len(BANNED))),
+        ("Total bans", str(s.get("bans", 0))),
+        ("Declined requests", str(s.get("declined", 0))),
+        ("Unbans", str(s.get("unbans", 0))),
+        ("Last scan", last_scan_text()),
+        ("Uptime", f"{up // 60}h {up % 60}m"),
     ]
-    return "\n".join(b(x) for x in lines)
+    return "\n".join(["📊 " + b("Stats"), "", table(rows)])
 
 
 async def get_stats() -> str:
