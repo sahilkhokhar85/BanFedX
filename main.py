@@ -522,17 +522,32 @@ async def ask_ids(event, mode: str):
 async def do_ban(event, ids):
     if not ids:
         return await show(event, b("No valid user ID found."), [MENU_BTN])
+    new = [i for i in ids if i not in BANNED]
+    already = [i for i in ids if i in BANNED]
+
+    parts = []
+    if new:
+        parts.append(b(f"✅ {len(new)} new ID(s) added. Banning in progress, results in the log channel."))
+    if already:
+        shown = " ".join(code(i) for i in already[:10])
+        more = b(f" +{len(already) - 10} more") if len(already) > 10 else ""
+        parts.append(b(f"ℹ️ {len(already)} already in the list:") + "\n" + shown + more)
+    if not new:
+        parts.append(b("Nothing to add. The automatic scan keeps checking them."))
+        return await show(event, "\n\n".join(parts), [MENU_BTN])
+
     sender = await event.get_sender()
     now = int(time.time())
     await db.banned.bulk_write(
-        [UpdateOne({"_id": i}, {"$setOnInsert": {"added_at": now}}, upsert=True) for i in ids]
+        [UpdateOne({"_id": i}, {"$setOnInsert": {"added_at": now}}, upsert=True) for i in new]
     )
-    BANNED.update(ids)
-    await send_log(f"{b('📝 Ban command:')} {label(sender)} {b(f'- {len(ids)} ID(s)')}")
-    await show(event, b(f"✅ {len(ids)} ID(s) added to the list. Banning in progress, results in the log channel."), [MENU_BTN])
+    BANNED.update(new)
+    skipped = f", {len(already)} already listed" if already else ""
+    await send_log(f"{b('📝 Ban command:')} {label(sender)} {b(f'- {len(new)} new ID(s){skipped}')}")
+    await show(event, "\n\n".join(parts), [MENU_BTN])
 
     async def job():
-        ok, fail = await ban_ids(ids)
+        ok, fail = await ban_ids(new)
         await scan_all("after ban")
         await send_log(b(f"✅ Ban finished: direct ok={ok}, not resolved yet={fail} (they will be caught on join or by scan)"))
 
