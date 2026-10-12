@@ -33,7 +33,7 @@ MONGO_DB = os.environ.get("MONGO_DB", "banbot")
 LOG_ID = int(os.environ["LOG_CHAT_ID"])
 SEED_FILE = os.environ.get("SEED_FILE", "ids.txt")
 PENDING_SECONDS = int(os.environ.get("PENDING_SECONDS", "45"))  # backup poll for join requests
-SCAN_MINUTES = int(os.environ.get("SCAN_MINUTES", "360"))  # full member scan, 0 = off
+SCAN_MINUTES = int(os.environ.get("SCAN_MINUTES", "30"))  # full member scan, 0 = off
 RATE_DELAY = 0.7  # gentle pace for a real account
 
 user = None  # engine
@@ -146,7 +146,7 @@ async def refresh_chats(initial: bool = False):
     if initial:
         return
     for c, t in lost:
-        warn_once(("lost", c), b(f"⚠️ Chalu chat me ban rights nahi mil rahi: {t}"))
+        warn_once(("lost", c), b(f"⚠️ Lost ban rights in an active chat: {t}"))
 
 
 # ======================= engine: actions =======================
@@ -157,12 +157,12 @@ async def ban(entity, target) -> str:
             await user(functions.channels.EditBannedRequest(entity, target, FULL_BAN))
             return "ok"
         except errors.FloodWaitError as e:
-            warn_once(("flood", entity.id), b(f"⏳ Telegram ne rok diya (FloodWait {e.seconds}s) - {entity.title}"), 600)
+            warn_once(("flood", entity.id), b(f"⏳ Telegram rate limit (FloodWait {e.seconds}s) - {entity.title}"), 600)
             await asyncio.sleep(e.seconds + 1)
         except (ValueError, errors.UserIdInvalidError, errors.PeerIdInvalidError):
             return "invalid"  # id not known to the account yet
         except (errors.ChatAdminRequiredError, errors.ChatWriteForbiddenError):
-            warn_once(("noright", entity.id), b(f"⚠️ Ban rights nahi hain: {entity.title}"))
+            warn_once(("noright", entity.id), b(f"⚠️ No ban rights in: {entity.title}"))
             return "forbidden"
         except Exception as e:
             log.warning("ban failed in %s: %s", entity.title, e)
@@ -213,7 +213,7 @@ async def process_pending(entity) -> int:
         await asyncio.sleep(e.seconds + 1)
         return 0
     except errors.ChatAdminRequiredError:
-        warn_once(("invite", entity.id), b(f"⚠️ {entity.title}: join requests check nahi ho pa rahe (Invite users right chahiye)"))
+        warn_once(("invite", entity.id), b(f"⚠️ {entity.title}: cannot check join requests (Invite users right needed)"))
         return 0
     except Exception as e:
         log.warning("pending fetch failed in %s: %s", entity.title, e)
@@ -226,7 +226,7 @@ async def process_pending(entity) -> int:
             n += 1
             await bump("declined")
             await bump("bans")
-            await send_log(f"{b('🚫 Join request decline + ban:')} {label(u)} {b('in ' + entity.title)}")
+            await send_log(f"{b('🚫 Join request declined + banned:')} {label(u)} {b('in ' + entity.title)}")
             await asyncio.sleep(RATE_DELAY)
     return n
 
@@ -247,23 +247,28 @@ async def scan_chat(entity):
     except errors.FloodWaitError as e:
         await asyncio.sleep(e.seconds + 1)
     except Exception as e:
-        warn_once(("scan", entity.id), b(f"⚠️ {entity.title}: members scan nahi ho paya ({type(e).__name__})"))
+        warn_once(("scan", entity.id), b(f"⚠️ {entity.title}: member scan failed ({type(e).__name__})"))
     if banned:
         await bump("bans", banned)
-    await send_log_lines(b(f"🚫 Scan me ban hue - {entity.title}:"), lines)
+    await send_log_lines(b(f"🚫 Banned by scan - {entity.title}:"), lines)
     return checked, banned, declined
 
 
-async def scan_all(reason: str):
+async def scan_all(reason: str, quiet: bool = False):
+    """quiet=True (auto scans): the log channel only hears about it when something was found."""
     async with SCAN_LOCK:
         t0 = time.time()
-        await send_log(b(f"🔍 Scan shuru ({reason}) - {len(MODERATED)} chats"))
+        if not quiet:
+            await send_log(b(f"🔍 Scan started ({reason}) - {len(MODERATED)} chats"))
         rows = []
+        total = 0
         for ent in list(MODERATED.values()):
             c, bn, dc = await scan_chat(ent)
+            total += bn + dc
             rows.append(b(f"• {ent.title}: checked {c}, banned {bn}, declined {dc}"))
         STATE["last_scan"] = time.time()
-        await send_log("\n".join([b(f"✅ Scan khatam ({int(time.time() - t0)}s)")] + rows))
+        if not quiet or total:
+            await send_log("\n".join([b(f"✅ Scan finished ({int(time.time() - t0)}s)")] + rows))
 
 
 async def ban_ids(ids):
@@ -291,7 +296,7 @@ async def ban_ids(ids):
                 await asyncio.sleep(RATE_DELAY)
         if lines:
             await bump("bans", len(lines))
-        await send_log_lines(b(f"🚫 Ban hue - {ent.title}:"), lines)
+        await send_log_lines(b(f"🚫 Banned - {ent.title}:"), lines)
     return ok, fail
 
 
@@ -307,12 +312,12 @@ async def unban_ids(ids):
                     lines.append("• " + label(u))
                     await asyncio.sleep(RATE_DELAY)
         except Exception as e:
-            warn_once(("unban", ent.id), b(f"⚠️ {ent.title}: unban list nahi mili ({type(e).__name__})"))
+            warn_once(("unban", ent.id), b(f"⚠️ {ent.title}: could not read banned list ({type(e).__name__})"))
         total += len(lines)
-        await send_log_lines(b(f"✅ Unban hue - {ent.title}:"), lines)
+        await send_log_lines(b(f"✅ Unbanned - {ent.title}:"), lines)
     if total:
         await bump("unbans", total)
-    await send_log(b(f"✅ Unban khatam: {total} unban entries"))
+    await send_log(b(f"✅ Unban finished: {total} user(s) unbanned"))
 
 
 # ======================= engine: live events =======================
@@ -331,57 +336,60 @@ async def on_chat_action(event):
     for u in await event.get_users():
         if u.id in BANNED and await ban(ent, u) == "ok":
             await bump("bans")
-            await send_log(f"{b('🚫 Join pe ban:')} {label(u)} {b('in ' + ent.title)}")
+            await send_log(f"{b('🚫 Banned on join:')} {label(u)} {b('in ' + ent.title)}")
 
 
-async def on_group_message(event):
-    ent = MODERATED.get(event.chat_id)
-    if not ent or event.sender_id not in BANNED:
-        return
-    sender = await event.get_sender()
-    if sender and await ban(ent, sender) == "ok":
-        try:
-            await event.delete()
-        except Exception:
-            pass
-        await bump("bans")
-        await send_log(f"{b('🚫 Active dikha, ban + msg delete:')} {label(sender)} {b('in ' + ent.title)}")
+# ======================= panel (bot): clean menu, everything by buttons =======================
+AWAIT: dict[int, str] = {}  # owner id -> "ban" / "unban" (bot is waiting for ids)
+MENU_BTN = [Button.inline("⬅️ Menu", b"menu")]
 
 
-# ======================= panel (bot) =======================
-def panel():
-    return [
-        [Button.inline("📊 Stats", b"stats"), Button.inline("📋 Chats", b"chats")],
+def ago(ts) -> str:
+    if not ts:
+        return "never"
+    m = int((time.time() - ts) // 60)
+    return "just now" if m < 1 else (f"{m} min ago" if m < 120 else f"{m // 60} h ago")
+
+
+async def show(event, text: str, buttons=None):
+    """Button taps edit the same message (clean chat); typed messages get a new one."""
+    try:
+        if isinstance(event, events.CallbackQuery.Event):
+            await event.edit(text, parse_mode="html", buttons=buttons)
+        else:
+            await event.respond(text, parse_mode="html", buttons=buttons)
+    except errors.MessageNotModifiedError:
+        pass
+
+
+async def menu(event):
+    s = await db.meta.find_one({"_id": "stats"}) or {}
+    text = "\n".join(
+        [
+            b("🛡 Haters Ban System"),
+            b("🟢 Running - works automatically"),
+            b(f"👥 Chats: {len(MODERATED)}    🚫 Banned IDs: {len(BANNED)}"),
+            b(f"Total bans: {s.get('bans', 0)}    Last scan: {ago(STATE['last_scan'])}"),
+        ]
+    )
+    buttons = [
+        [Button.inline("🚫 Ban", b"ban"), Button.inline("✅ Unban", b"unban")],
+        [Button.inline("📋 Chats", b"chats"), Button.inline("📊 Stats", b"stats")],
         [Button.inline("🔍 Scan now", b"scan"), Button.inline("📄 Banned list", b"list")],
     ]
-
-
-def help_text() -> str:
-    lines = [
-        "🛡 Control panel",
-        "/ban <ids> - sab chats me ban",
-        "/unban <ids>",
-        "/check <id>",
-        "/list - last 50 banned ids",
-        "/chats - chats dekho, jodo ya hatao",
-        "/stats - status",
-        "/scan - members + join requests abhi check",
-        ".txt file bhejo = bulk ban",
-    ]
-    return "\n".join(b(x) for x in lines)
+    await show(event, text, buttons)
 
 
 def stats_text(s: dict) -> str:
-    last = time.strftime("%d %b %H:%M UTC", time.gmtime(STATE["last_scan"])) if STATE["last_scan"] else "abhi tak nahi"
     up = int(time.time() - STATE["started"]) // 60
     lines = [
         "📊 Stats",
         f"Banned list: {len(BANNED)} IDs",
-        f"Chats: {len(MODERATED)}",
-        f"Total ban: {s.get('bans', 0)}",
-        f"Join requests decline: {s.get('declined', 0)}",
+        f"Active chats: {len(MODERATED)}",
+        f"Total bans: {s.get('bans', 0)}",
+        f"Join requests declined: {s.get('declined', 0)}",
         f"Unban: {s.get('unbans', 0)}",
-        f"Last scan: {last}",
+        f"Last scan: {ago(STATE['last_scan'])}",
         f"Uptime: {up} min",
     ]
     return "\n".join(b(x) for x in lines)
@@ -391,19 +399,27 @@ async def get_stats() -> str:
     return stats_text(await db.meta.find_one({"_id": "stats"}) or {})
 
 
-async def chats_text() -> str:
-    if not MODERATED:
-        return b("Abhi koi chat chalu nahi hai. '➕ Chat jodo' dabao.")
-    lines = [b(f"🟢 Chalu chats: {len(MODERATED)}")] + [f"{b(e.title)} {code(c)}" for c, e in MODERATED.items()]
-    return "\n".join(lines)
+async def stats_screen(event):
+    await show(event, await get_stats(), [MENU_BTN])
 
 
-async def send_chats(event):
-    buttons = [[Button.inline("➕ Chat jodo", b"add"), Button.inline("➖ Chat hatao", b"remove")]]
-    await event.respond(await chats_text(), parse_mode="html", buttons=buttons)
+async def list_screen(event):
+    rows = [d["_id"] async for d in db.banned.find().sort("added_at", -1).limit(50)]
+    text = b(f"📄 Banned list: {len(BANNED)} IDs (last 50)") + "\n" + "\n".join(code(i) for i in rows)
+    await show(event, text, [MENU_BTN])
 
 
-async def show_add(event):
+async def chats_screen(event):
+    if MODERATED:
+        lines = [b(f"🟢 Active chats: {len(MODERATED)}")] + [f"{b(e.title)} {code(c)}" for c, e in MODERATED.items()]
+        text = "\n".join(lines)
+    else:
+        text = b("No active chats yet. Tap ➕ Add chat.")
+    buttons = [[Button.inline("➕ Add chat", b"add"), Button.inline("➖ Remove chat", b"remove")], MENU_BTN]
+    await show(event, text, buttons)
+
+
+async def add_screen(event):
     await refresh_chats(initial=True)  # pick up chats where the account just became admin
     rows = [
         [Button.inline(e.title[:35], f"add:{c}".encode()), Button.inline("🗑", f"hide:{c}".encode())]
@@ -411,152 +427,168 @@ async def show_add(event):
         if c not in ENABLED and c not in HIDDEN
     ]
     if rows:
-        text = b("Naam dabao = chalu karo. 🗑 dabao = hamesha ke liye list se hatao:")
+        text = b("Tap a chat to activate it. 🗑 hides it from this list forever:")
     else:
-        text = b("Koi chat nahi bacha. Naye chat ke liye account ko wahan admin banao (Ban users right), phir dobara dabao.")
+        text = b("No chats found. Make the account an admin there (Ban users right), then tap again.")
     if HIDDEN:
-        rows.append([Button.inline("♻️ Chhupe chats wapas dikhao", b"unhide")])
-    await event.respond(text, parse_mode="html", buttons=rows[:50] or None)
+        rows.append([Button.inline("♻️ Show hidden chats", b"unhide")])
+    rows.append([Button.inline("⬅️ Back", b"chats")])
+    await show(event, text, rows[:50])
+
+
+async def remove_screen(event):
+    rows = [[Button.inline(t[:35], f"rm:{c}".encode())] for c, t in ENABLED.items()]
+    text = b("Which chat should be deactivated? Tap one:") if rows else b("No active chats.")
+    rows.append([Button.inline("⬅️ Back", b"chats")])
+    await show(event, text, rows[:50])
+
+
+async def enable_chat(event, cid: int):
+    ent = CANDIDATES.get(cid)
+    if ent:
+        ENABLED[cid] = ent.title
+        await db.chats.update_one({"_id": cid}, {"$set": {"title": ent.title}}, upsert=True)
+        MODERATED[cid] = ent
+        sender = await event.get_sender()
+        await send_log(f"{b('➕ Chat activated:')} {b(ent.title)} {code(cid)} {b('by')} {label(sender)}")
+        asyncio.create_task(scan_chat(ent))
+    await chats_screen(event)
+
+
+async def disable_chat(event, cid: int):
+    title = ENABLED.pop(cid, None)
+    if title is not None:
+        await db.chats.delete_one({"_id": cid})
+        MODERATED.pop(cid, None)
+        sender = await event.get_sender()
+        await send_log(f"{b('➖ Chat deactivated:')} {b(title)} {code(cid)} {b('by')} {label(sender)}")
+    await chats_screen(event)
 
 
 async def hide_chat(event, cid: int):
     ent = CANDIDATES.get(cid)
-    title = ent.title if ent else str(cid)
     HIDDEN.add(cid)
-    await db.hidden.update_one({"_id": cid}, {"$set": {"title": title}}, upsert=True)
-    await event.respond(b(f"🗑 {title} hamesha ke liye hata diya. Ab list me nahi dikhega."), parse_mode="html")
+    await db.hidden.update_one({"_id": cid}, {"$set": {"title": ent.title if ent else str(cid)}}, upsert=True)
+    await add_screen(event)
 
 
 async def unhide_all(event):
     HIDDEN.clear()
     await db.hidden.delete_many({})
-    await event.respond(b("♻️ Chhupe chats wapas aa gaye. /chats me 'Chat jodo' dabao."), parse_mode="html")
-
-
-async def show_remove(event):
-    rows = [[Button.inline(t[:40], f"rm:{c}".encode())] for c, t in ENABLED.items()]
-    if not rows:
-        return await event.respond(b("Koi chat chalu nahi hai."), parse_mode="html")
-    await event.respond(b("Kaun sa chat band karna hai? Tap karo:"), parse_mode="html", buttons=rows[:50])
-
-
-async def enable_chat(event, cid: int):
-    ent = CANDIDATES.get(cid)
-    if not ent:
-        return await event.respond(b("Chat nahi mila. /add dubara chalao."), parse_mode="html")
-    ENABLED[cid] = ent.title
-    await db.chats.update_one({"_id": cid}, {"$set": {"title": ent.title}}, upsert=True)
-    MODERATED[cid] = ent
-    sender = await event.get_sender()
-    await send_log(f"{b('➕ Chat chalu kiya:')} {b(ent.title)} {code(cid)} {b('by')} {label(sender)}")
-    await event.respond(b(f"✅ {ent.title} chalu. Scan shuru, result log channel me."), parse_mode="html")
-    asyncio.create_task(scan_chat(ent))
-
-
-async def disable_chat(event, cid: int):
-    title = ENABLED.pop(cid, None)
-    if title is None:
-        return await event.respond(b("Ye chat chalu nahi tha."), parse_mode="html")
-    await db.chats.delete_one({"_id": cid})
-    MODERATED.pop(cid, None)
-    sender = await event.get_sender()
-    await send_log(f"{b('➖ Chat band kiya:')} {b(title)} {code(cid)} {b('by')} {label(sender)}")
-    await event.respond(b(f"✅ {title} band. Ab us me kuch nahi hoga."), parse_mode="html")
-
-
-async def list_text() -> str:
-    rows = [d["_id"] async for d in db.banned.find().sort("added_at", -1).limit(50)]
-    return b(f"Total: {len(BANNED)} (last 50)") + "\n" + "\n".join(code(i) for i in rows)
+    await add_screen(event)
 
 
 async def start_scan(event):
-    await event.respond(b("Scan shuru. Result log channel me aayega."), parse_mode="html")
     asyncio.create_task(scan_all("manual"))
+    await show(event, b("🔍 Scan started. Results will appear in the log channel."), [MENU_BTN])
+
+
+async def ask_ids(event, mode: str):
+    AWAIT[event.sender_id] = mode
+    what = "ban" if mode == "ban" else "unban"
+    text = b(f"Send the user ID(s) to {what} (one or many, separated by space or new line). A .txt file works too.")
+    await show(event, text, [[Button.inline("❌ Cancel", b"menu")]])
 
 
 async def do_ban(event, ids):
     if not ids:
-        await event.respond(b("Koi valid user id nahi mili."), parse_mode="html")
-        return
+        return await show(event, b("No valid user ID found."), [MENU_BTN])
     sender = await event.get_sender()
     now = int(time.time())
     await db.banned.bulk_write(
         [UpdateOne({"_id": i}, {"$setOnInsert": {"added_at": now}}, upsert=True) for i in ids]
     )
     BANNED.update(ids)
-    await send_log(f"{b('📝 Ban command:')} {label(sender)} {b(f'- {len(ids)} id(s)')}")
-    await event.respond(b(f"{len(ids)} id(s) add. Ban + scan chal raha hai, result log channel me."), parse_mode="html")
+    await send_log(f"{b('📝 Ban command:')} {label(sender)} {b(f'- {len(ids)} ID(s)')}")
+    await show(event, b(f"✅ {len(ids)} ID(s) added to the list. Banning in progress, results in the log channel."), [MENU_BTN])
 
     async def job():
         ok, fail = await ban_ids(ids)
-        await scan_all("ban ke baad")
-        await send_log(b(f"✅ Ban command khatam: direct ok={ok}, abhi-pehchane-nahi={fail} (wo join/scan pe pakde jayenge)"))
+        await scan_all("after ban")
+        await send_log(b(f"✅ Ban finished: direct ok={ok}, not resolved yet={fail} (they will be caught on join or by scan)"))
 
     asyncio.create_task(job())
 
 
+async def do_unban(event, ids):
+    if not ids:
+        return await show(event, b("No valid user ID found."), [MENU_BTN])
+    sender = await event.get_sender()
+    await db.banned.delete_many({"_id": {"$in": ids}})
+    BANNED.difference_update(ids)
+    await send_log(f"{b('📝 Unban command:')} {label(sender)} {b(f'- {len(ids)} ID(s)')}")
+    await show(event, b(f"✅ {len(ids)} ID(s) removed from the list. Unbanning in progress, results in the log channel."), [MENU_BTN])
+    asyncio.create_task(unban_ids(ids))
+
+
 async def on_command(event):
+    mode = AWAIT.pop(event.sender_id, None)
     f = event.file
     if f and f.name and f.name.lower().endswith((".txt", ".csv")) and (f.size or 0) < 5_000_000:
         data = (await event.message.download_media(file=bytes)).decode("utf-8", errors="ignore")
-        return await do_ban(event, parse_ids(data))
-    m = re.match(r"^/(\w+)(?:@\w+)?\s*(.*)$", event.raw_text or "", re.S)
-    if not m:
-        return
+        ids = parse_ids(data)
+        return await (do_unban(event, ids) if mode == "unban" else do_ban(event, ids))
+
+    text = event.raw_text or ""
+    m = re.match(r"^/(\w+)(?:@\w+)?\s*(.*)$", text, re.S)
+    if not m:  # plain message: if we asked for ids, use them, otherwise just show the menu
+        if mode in ("ban", "unban"):
+            ids = parse_ids(text)
+            return await (do_unban(event, ids) if mode == "unban" else do_ban(event, ids))
+        return await menu(event)
+
     cmd, ids = m.group(1).lower(), parse_ids(m.group(2))
-    if cmd in ("start", "help", "panel"):
-        await event.respond(help_text(), parse_mode="html", buttons=panel())
-    elif cmd == "ban":
-        await do_ban(event, ids)
+    if cmd == "ban":
+        await (do_ban(event, ids) if ids else ask_ids(event, "ban"))
     elif cmd == "unban":
-        if not ids:
-            return await event.respond(b("Usage: /unban <id>"), parse_mode="html")
-        sender = await event.get_sender()
-        await db.banned.delete_many({"_id": {"$in": ids}})
-        BANNED.difference_update(ids)
-        await send_log(f"{b('📝 Unban command:')} {label(sender)} {b(f'- {len(ids)} id(s)')}")
-        await event.respond(b(f"{len(ids)} id(s) list se hata di. Unban ho rahe hain, result log channel me."), parse_mode="html")
-        asyncio.create_task(unban_ids(ids))
+        await (do_unban(event, ids) if ids else ask_ids(event, "unban"))
     elif cmd == "check" and ids:
-        msg = "BANNED list me hai" if ids[0] in BANNED else "list me nahi hai"
-        await event.respond(f"{code(ids[0])} {b(msg)}", parse_mode="html")
+        msg = "is in the BANNED list" if ids[0] in BANNED else "is not in the list"
+        await show(event, f"{code(ids[0])} {b(msg)}", [MENU_BTN])
     elif cmd == "list":
-        await event.respond(await list_text(), parse_mode="html")
+        await list_screen(event)
     elif cmd == "chats":
-        await send_chats(event)
+        await chats_screen(event)
     elif cmd == "stats":
-        await event.respond(await get_stats(), parse_mode="html")
+        await stats_screen(event)
     elif cmd == "scan":
         await start_scan(event)
     elif cmd == "add":
-        await show_add(event)
+        await add_screen(event)
     elif cmd in ("remove", "rm"):
-        await show_remove(event)
+        await remove_screen(event)
+    else:
+        await menu(event)
 
 
 async def on_callback(event):
     data = event.data.decode()
     await event.answer()
-    if data == "stats":
-        await event.respond(await get_stats(), parse_mode="html")
+    AWAIT.pop(event.sender_id, None)
+    if data == "menu":
+        await menu(event)
+    elif data in ("ban", "unban"):
+        await ask_ids(event, data)
     elif data == "chats":
-        await send_chats(event)
+        await chats_screen(event)
+    elif data == "stats":
+        await stats_screen(event)
     elif data == "list":
-        await event.respond(await list_text(), parse_mode="html")
+        await list_screen(event)
     elif data == "scan":
         await start_scan(event)
     elif data == "add":
-        await show_add(event)
+        await add_screen(event)
     elif data == "remove":
-        await show_remove(event)
+        await remove_screen(event)
+    elif data == "unhide":
+        await unhide_all(event)
     elif data.startswith("add:"):
         await enable_chat(event, int(data[4:]))
     elif data.startswith("rm:"):
         await disable_chat(event, int(data[3:]))
     elif data.startswith("hide:"):
         await hide_chat(event, int(data[5:]))
-    elif data == "unhide":
-        await unhide_all(event)
 
 
 # ======================= background loops =======================
@@ -581,7 +613,7 @@ async def scan_loop():
     while True:
         await asyncio.sleep(SCAN_MINUTES * 60)
         try:
-            await scan_all("auto")
+            await scan_all("auto", quiet=True)
         except Exception as e:
             log.warning("scan failed: %s", e)
 
@@ -617,14 +649,13 @@ async def main():
 
     user.add_event_handler(on_pending_update, events.Raw(types.UpdatePendingJoinRequests))
     user.add_event_handler(on_chat_action, events.ChatAction)
-    user.add_event_handler(on_group_message, events.NewMessage(incoming=True, func=lambda e: not e.is_private))
     bot.add_event_handler(
         on_command,
         events.NewMessage(incoming=True, from_users=list(OWNER_IDS), func=lambda e: e.is_private),
     )
     bot.add_event_handler(on_callback, events.CallbackQuery(func=lambda e: e.sender_id in OWNER_IDS))
 
-    chat_lines = [b(f"• {e.title}") for e in MODERATED.values()] or [b("• (koi chat chalu nahi - bot me /add se chalu karo)")]
+    chat_lines = [b(f"• {e.title}") for e in MODERATED.values()] or [b("• (no active chats - open Chats > Add chat in the bot)")]
     await send_log("\n".join([b("🟢 System online"), b(f"Banned IDs: {len(BANNED)}"), b(f"Chats: {len(MODERATED)}")] + chat_lines))
     log.info("System ready: %s banned ids, %s chats", len(BANNED), len(MODERATED))
 
