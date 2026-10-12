@@ -435,7 +435,7 @@ async def export_list(event):
         return await show(event, b("The ban list is empty."), [MENU_BTN])
     f = io.BytesIO("\n".join(map(str, ids)).encode())
     f.name = "banned_ids.txt"
-    await bot.send_file(event.chat_id, f, caption=b(f"📥 Banned list: {len(ids)} IDs"), parse_mode="html")
+    await bot.send_file(event.chat_id, f, caption=b(f"📥 Banned list: {len(ids)} IDs"), parse_mode="html", buttons=[MENU_BTN])
 
 
 async def chats_screen(event):
@@ -521,7 +521,7 @@ async def ask_ids(event, mode: str):
 
 async def do_ban(event, ids):
     if not ids:
-        return await show(event, b("No valid user ID found."), [MENU_BTN])
+        return await show(event, b("No valid user ID found. Send numeric IDs like 123456789."), [[Button.inline("🔁 Try again", b"ban")], MENU_BTN])
     new = [i for i in ids if i not in BANNED]
     already = [i for i in ids if i in BANNED]
 
@@ -534,7 +534,7 @@ async def do_ban(event, ids):
         parts.append(b(f"ℹ️ {len(already)} already in the list:") + "\n" + shown + more)
     if not new:
         parts.append(b("Nothing to add. The automatic scan keeps checking them."))
-        return await show(event, "\n\n".join(parts), [MENU_BTN])
+        return await show(event, "\n\n".join(parts), [[Button.inline("🚫 Ban more", b"ban")], MENU_BTN])
 
     sender = await event.get_sender()
     now = int(time.time())
@@ -544,7 +544,7 @@ async def do_ban(event, ids):
     BANNED.update(new)
     skipped = f", {len(already)} already listed" if already else ""
     await send_log(f"{b('📝 Ban command:')} {label(sender)} {b(f'- {len(new)} new ID(s){skipped}')}")
-    await show(event, "\n\n".join(parts), [MENU_BTN])
+    await show(event, "\n\n".join(parts), [[Button.inline("🚫 Ban more", b"ban")], MENU_BTN])
 
     async def job():
         ok, fail = await ban_ids(new)
@@ -556,12 +556,12 @@ async def do_ban(event, ids):
 
 async def do_unban(event, ids):
     if not ids:
-        return await show(event, b("No valid user ID found."), [MENU_BTN])
+        return await show(event, b("No valid user ID found. Send numeric IDs like 123456789."), [[Button.inline("🔁 Try again", b"unban")], MENU_BTN])
     sender = await event.get_sender()
     await db.banned.delete_many({"_id": {"$in": ids}})
     BANNED.difference_update(ids)
     await send_log(f"{b('📝 Unban command:')} {label(sender)} {b(f'- {len(ids)} ID(s)')}")
-    await show(event, b(f"✅ {len(ids)} ID(s) removed from the list. Unbanning in progress, results in the log channel."), [MENU_BTN])
+    await show(event, b(f"✅ {len(ids)} ID(s) removed from the list. Unbanning in progress, results in the log channel."), [[Button.inline("✅ Unban more", b"unban")], MENU_BTN])
     asyncio.create_task(unban_ids(ids))
 
 
