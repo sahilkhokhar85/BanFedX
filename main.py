@@ -9,6 +9,7 @@ Telegram haters-ban system (ONE process, ONE file)
 import asyncio
 import hashlib
 import html
+import io
 import logging
 import os
 import re
@@ -423,8 +424,18 @@ async def stats_screen(event):
 
 async def list_screen(event):
     rows = [d["_id"] async for d in db.banned.find().sort("added_at", -1).limit(50)]
-    text = b(f"📄 Banned list: {len(BANNED)} IDs (last 50)") + "\n" + "\n".join(code(i) for i in rows)
-    await show(event, text, [MENU_BTN])
+    text = b(f"📄 Banned list: {len(BANNED)} IDs in total (showing last 50)") + "\n" + "\n".join(code(i) for i in rows)
+    await show(event, text, [[Button.inline("📥 Export all", b"export")], MENU_BTN])
+
+
+async def export_list(event):
+    """Send the full ban list as a .txt file (one ID per line)."""
+    ids = [d["_id"] async for d in db.banned.find().sort("added_at", 1)]
+    if not ids:
+        return await show(event, b("The ban list is empty."), [MENU_BTN])
+    f = io.BytesIO("\n".join(map(str, ids)).encode())
+    f.name = "banned_ids.txt"
+    await bot.send_file(event.chat_id, f, caption=b(f"📥 Banned list: {len(ids)} IDs"), parse_mode="html")
 
 
 async def chats_screen(event):
@@ -569,6 +580,8 @@ async def on_command(event):
         await chats_screen(event)
     elif cmd == "stats":
         await stats_screen(event)
+    elif cmd == "export":
+        await export_list(event)
     elif cmd == "scan":
         await start_scan(event)
     elif cmd == "add":
@@ -593,6 +606,8 @@ async def on_callback(event):
         await stats_screen(event)
     elif data == "list":
         await list_screen(event)
+    elif data == "export":
+        await export_list(event)
     elif data == "scan":
         await start_scan(event)
     elif data == "add":
