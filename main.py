@@ -7,6 +7,7 @@ Telegram haters-ban system (ONE process, ONE file)
   LOG channel              = every action is reported here
 """
 import asyncio
+import csv
 import hashlib
 import html
 import io
@@ -46,6 +47,10 @@ MODERATED: dict[int, object] = {}  # only chats YOU enabled with /add
 ENABLED: dict[int, str] = {}  # enabled chat id -> title (stored in MongoDB)
 HIDDEN: set[int] = set()  # chats you removed from the lists forever (stored in MongoDB)
 EXEMPT: dict[int, set[int]] = {}  # chat id -> users on the ban list who must NOT be banned in that chat
+HASHES: dict[int, int] = {}  # banned user id -> access_hash learned by the account (lets us pre-ban non-members)
+DONE: set = set()  # (chat id, user id) pairs already banned by us, so work is never repeated
+PREBAN_Q = None  # users whose hash was just learned -> banned in all other chats
+RESOLVE = {"running": False}
 WARNED: dict = {}
 STATE = {"last_scan": 0, "started": time.time()}
 SCAN_LOCK = None
@@ -74,13 +79,33 @@ def label(u) -> str:
     return f"{b(text)} {code(u.id)}" if text else code(u.id)
 
 
+def parse_file(text: str, fname: str):
+    """Returns (ids, {id: username}). A CSV with an 'id' column is read column-wise."""
+    if fname.lower().endswith(".csv"):
+        try:
+            rows = list(csv.DictReader(io.StringIO(text)))
+            if rows and "id" in rows[0]:
+                ids, names = {}, {}
+                for r in rows:
+                    raw = (r.get("id") or "").strip()
+                    if raw.isdigit() and 5 <= len(raw) <= 11:
+                        ids[int(raw)] = 1
+                        un = (r.get("username") or "").strip().lstrip("@")
+                        if un:
+                            names[int(raw)] = un
+                return list(ids), names
+        except Exception:
+            pass
+    return parse_ids(text), {}
+
+
 def is_target(entity, uid: int) -> bool:
     """True if this user must be banned in this chat: on the ban list and not exempted for this chat."""
     return uid in BANNED and uid not in EXEMPT.get(utils.get_peer_id(entity), ())
 
 
 def parse_ids(text: str) -> list[int]:
-    return list({int(x) for x in re.findall(r"\d{5,11}(?!\d)", text or "")})
+    return list({int(x) for x in re.findall(r"(?<!\d)\d{5,11}(?!\d)", text or "")})
 
 
 # ======================= logging to the log channel =======================
@@ -157,11 +182,36 @@ async def refresh_chats(initial: bool = False):
 
 
 # ======================= engine: actions =======================
+async def mark_done(entity, uid):
+    cid = utils.get_peer_id(entity)
+    if uid is None or (cid, uid) in DONE:
+        return
+    DONE.add((cid, uid))
+    await db.done.update_one({"_id": f"{cid}:{uid}"}, {"$set": {"chat": cid, "user": uid}}, upsert=True)
+
+
+def remember(u):
+    """Store the access_hash of a listed user the first time we see him anywhere.
+    From then on he can be pre-banned in every chat, even where he never joined."""
+    uid = getattr(u, "id", None)
+    h = getattr(u, "access_hash", None)
+    if uid in BANNED and h and not getattr(u, "min", False) and HASHES.get(uid) != h:
+        is_new = uid not in HASHES
+        HASHES[uid] = h
+        asyncio.create_task(db.banned.update_one({"_id": uid}, {"$set": {"hash": h}}))
+        if is_new and PREBAN_Q is not None:
+            PREBAN_Q.put_nowait(uid)
+
+
 async def ban(entity, target) -> str:
     """target = User object or int id. Returns ok / invalid / forbidden / fail."""
+    uid = target if isinstance(target, int) else getattr(target, "id", None)
+    if isinstance(target, int) and target in HASHES:
+        target = types.InputPeerUser(target, HASHES[target])  # known hash: works even if never joined
     for _ in range(3):
         try:
             await user(functions.channels.EditBannedRequest(entity, target, FULL_BAN))
+            await mark_done(entity, uid)
             return "ok"
         except errors.FloodWaitError as e:
             warn_once(("flood", entity.id), b(f"⏳ Telegram rate limit (FloodWait {e.seconds}s) - {entity.title}"), 600)
@@ -227,6 +277,7 @@ async def process_pending(entity) -> int:
         return 0
     n = 0
     for u in users:
+        remember(u)
         if is_target(entity, u.id):
             await decline(entity, u)
             await ban(entity, u)
@@ -246,6 +297,7 @@ async def scan_chat(entity):
     try:
         async for u in user.iter_participants(entity):
             checked += 1
+            remember(u)
             if is_target(entity, u.id):
                 if await ban(entity, u) == "ok":
                     banned += 1
@@ -278,35 +330,119 @@ async def scan_all(reason: str, quiet: bool = False):
             await send_log("\n".join([b(f"✅ Scan finished ({int(time.time() - t0)}s)")] + rows))
 
 
-async def ban_ids(ids):
-    """Direct ban of ids the account can already resolve, in every moderated chat."""
-    ok = fail = 0
+async def ent_label(uid: int) -> str:
+    try:
+        ref = types.InputPeerUser(uid, HASHES[uid]) if uid in HASHES else uid
+        return label(await user.get_entity(ref))
+    except Exception:
+        return code(uid)
+
+
+async def ban_ids(ids, detail: bool = True):
+    """Ban every id the account can resolve, in every active chat. Works even if the user never joined
+    (pre-ban). Pairs already done are skipped. detail=False posts one summary line instead of names."""
+    ok = 0
     invalid = set()
     for ent in list(MODERATED.values()):
+        cid = utils.get_peer_id(ent)
         lines = []
         for uid in ids:
-            if not is_target(ent, uid):
-                continue  # exempted in this chat
+            if not is_target(ent, uid) or (cid, uid) in DONE:
+                continue
             if uid in invalid:
-                fail += 1
                 continue
             res = await ban(ent, uid)
             if res == "ok":
                 ok += 1
-                try:
-                    lines.append("• " + label(await user.get_entity(uid)))
-                except Exception:
-                    lines.append("• " + code(uid))
-            else:
-                fail += 1
-                if res == "invalid":
-                    invalid.add(uid)
+                if detail:
+                    lines.append("• " + await ent_label(uid))
+            elif res == "invalid":
+                invalid.add(uid)
             if res != "invalid":
                 await asyncio.sleep(RATE_DELAY)
         if lines:
             await bump("bans", len(lines))
         await send_log_lines(b(f"🚫 Banned - {ent.title}:"), lines)
-    return ok, fail
+    if ok and not detail:
+        await bump("bans", ok)
+        await send_log(b(f"🛡 Pre-ban: {ok} new ban(s) done in the background"))
+    return ok, len(invalid)
+
+
+# ---------- usernames -> access hashes (so IDs can be pre-banned) ----------
+async def save_usernames(names: dict):
+    await db.banned.bulk_write(
+        [UpdateOne({"_id": i}, {"$set": {"username": u}, "$unset": {"name_bad": ""}}) for i, u in names.items()]
+    )
+
+
+async def resolve_usernames():
+    """Look up saved usernames once, verify the id matches, store the hash, then pre-ban them everywhere."""
+    if RESOLVE["running"]:
+        return
+    RESOLVE["running"] = True
+    ok = bad = 0
+    fresh = []
+    todo = []
+    try:
+        todo = [
+            d
+            async for d in db.banned.find(
+                {"username": {"$exists": True, "$ne": ""}, "hash": {"$exists": False}, "name_bad": {"$exists": False}},
+                {"username": 1},
+            )
+        ]
+        for d in todo:
+            uid, uname = d["_id"], d["username"]
+            try:
+                ent = await user.get_entity(uname)
+                if isinstance(ent, types.User) and ent.id == uid and ent.access_hash:
+                    HASHES[uid] = ent.access_hash
+                    await db.banned.update_one({"_id": uid}, {"$set": {"hash": ent.access_hash}})
+                    ok += 1
+                    fresh.append(uid)
+                else:
+                    await db.banned.update_one({"_id": uid}, {"$set": {"name_bad": True}})
+                    bad += 1
+            except errors.FloodWaitError as e:
+                if e.seconds > 900:
+                    break  # too long: the rest is retried on the next start
+                await asyncio.sleep(e.seconds + 1)
+            except (ValueError, errors.UsernameNotOccupiedError, errors.UsernameInvalidError):
+                await db.banned.update_one({"_id": uid}, {"$set": {"name_bad": True}})
+                bad += 1
+            except Exception as e:
+                log.warning("username lookup failed: %s", e)
+            await asyncio.sleep(2)
+    finally:
+        RESOLVE["running"] = False
+    if todo:
+        left = len(todo) - ok - bad
+        await send_log(b(f"🔎 Username lookup: {ok} resolved, {bad} not found/changed, {left} left for later"))
+    if fresh:
+        await ban_ids(fresh, detail=False)
+
+
+async def preban_worker():
+    """Users whose hash was just learned (e.g. seen in a scan) get banned in all other chats too."""
+    while True:
+        batch = [await PREBAN_Q.get()]
+        await asyncio.sleep(10)
+        while not PREBAN_Q.empty():
+            batch.append(PREBAN_Q.get_nowait())
+        try:
+            await ban_ids(batch, detail=False)
+        except Exception as e:
+            log.warning("preban failed: %s", e)
+
+
+async def startup_prep():
+    await asyncio.sleep(20)
+    try:
+        await resolve_usernames()
+        await ban_ids(list(BANNED), detail=False)
+    except Exception as e:
+        log.warning("startup prep failed: %s", e)
 
 
 async def unban_ids(ids):
@@ -343,6 +479,7 @@ async def on_chat_action(event):
     if not ent:
         return
     for u in await event.get_users():
+        remember(u)
         if is_target(ent, u.id) and await ban(ent, u) == "ok":
             await bump("bans")
             await send_log(f"{b('🚫 Banned on join:')} {label(u)} {b('in ' + ent.title)}")
@@ -418,6 +555,7 @@ def stats_text(s: dict) -> str:
         ("Declined requests", str(s.get("declined", 0))),
         ("Unbans", str(s.get("unbans", 0))),
         ("Exceptions", str(sum(len(v) for v in EXEMPT.values()))),
+        ("Pre-bannable IDs", f"{sum(1 for i in HASHES if i in BANNED)}/{len(BANNED)}"),
         ("Last scan", last_scan_text()),
         ("Uptime", f"{up // 60}h {up % 60}m"),
     ]
@@ -491,6 +629,7 @@ async def enable_chat(event, cid: int):
         sender = await event.get_sender()
         await send_log(f"{b('➕ Chat activated:')} {b(ent.title)} {code(cid)} {b('by')} {label(sender)}")
         asyncio.create_task(scan_chat(ent))
+        asyncio.create_task(ban_ids(list(BANNED), detail=False))
     await chats_screen(event)
 
 
@@ -557,9 +696,9 @@ async def do_ban(event, ids):
     await show(event, "\n\n".join(parts), [[Button.inline("🚫 Ban more", b"ban")], MENU_BTN])
 
     async def job():
-        ok, fail = await ban_ids(new)
+        ok, unresolved = await ban_ids(new)
         await scan_all("after ban")
-        await send_log(b(f"✅ Ban finished: direct ok={ok}, not resolved yet={fail} (they will be caught on join or by scan)"))
+        await send_log(b(f"✅ Ban finished: {ok} ban(s) done, {unresolved} ID(s) not resolvable yet (caught on request, join or scan)"))
 
     asyncio.create_task(job())
 
@@ -569,7 +708,11 @@ async def do_unban(event, ids):
         return await show(event, b("No valid user ID found. Send numeric IDs like 123456789."), [[Button.inline("🔁 Try again", b"unban")], MENU_BTN])
     sender = await event.get_sender()
     await db.banned.delete_many({"_id": {"$in": ids}})
+    await db.done.delete_many({"user": {"$in": ids}})
     BANNED.difference_update(ids)
+    DONE.difference_update({p for p in DONE if p[1] in set(ids)})
+    for i in ids:
+        HASHES.pop(i, None)
     await send_log(f"{b('📝 Unban command:')} {label(sender)} {b(f'- {len(ids)} ID(s)')}")
     await show(event, b(f"✅ {len(ids)} ID(s) removed from the list. Unbanning in progress, results in the log channel."), [[Button.inline("✅ Unban more", b"unban")], MENU_BTN])
     asyncio.create_task(unban_ids(ids))
@@ -652,6 +795,8 @@ async def do_exempt(event, cid: int, ids):
         buttons = [[Button.inline("🔁 Try again", f"excadd:{cid}".encode())], [Button.inline("⬅️ Back", f"exc:{cid}".encode())]]
         return await show(event, b("No valid user ID found. Send numeric IDs like 123456789."), buttons)
     EXEMPT.setdefault(cid, set()).update(ids)
+    DONE.difference_update({(cid, i) for i in ids})
+    await db.done.delete_many({"_id": {"$in": [f"{cid}:{i}" for i in ids]}})
     await db.exempt.bulk_write(
         [UpdateOne({"_id": f"{cid}:{i}"}, {"$set": {"chat": cid, "user": i}}, upsert=True) for i in ids]
     )
@@ -692,8 +837,16 @@ async def on_command(event):
     f = event.file
     if f and f.name and f.name.lower().endswith((".txt", ".csv")) and (f.size or 0) < 5_000_000:
         data = (await event.message.download_media(file=bytes)).decode("utf-8", errors="ignore")
-        ids = parse_ids(data)
-        return await dispatch_ids(event, mode, ids)
+        ids, names = parse_file(data, f.name)
+        await dispatch_ids(event, mode, ids)
+        if names and mode in (None, "ban"):
+            await save_usernames(names)
+            asyncio.create_task(resolve_usernames())
+            await event.respond(
+                b(f"🔎 {len(names)} usernames saved. The account will look them up so those users can be banned in every chat even if they never joined. Progress is posted in the log channel."),
+                parse_mode="html",
+            )
+        return
 
     text = event.raw_text or ""
     m = re.match(r"^/(\w+)(?:@\w+)?\s*(.*)$", text, re.S)
@@ -813,8 +966,9 @@ async def report_loop():
 
 # ======================= start =======================
 async def main():
-    global user, bot, db, SCAN_LOCK
+    global user, bot, db, SCAN_LOCK, PREBAN_Q
     SCAN_LOCK = asyncio.Lock()
+    PREBAN_Q = asyncio.Queue()
     db = AsyncIOMotorClient(MONGO_URI)[MONGO_DB]
     BANNED.update([d["_id"] async for d in db.banned.find({}, {"_id": 1})])
     await seed()
@@ -822,6 +976,10 @@ async def main():
     HIDDEN.update([d["_id"] async for d in db.hidden.find({}, {"_id": 1})])
     async for d in db.exempt.find():
         EXEMPT.setdefault(d["chat"], set()).add(d["user"])
+    async for d in db.banned.find({"hash": {"$exists": True}}, {"hash": 1}):
+        HASHES[d["_id"]] = d["hash"]
+    async for d in db.done.find():
+        DONE.add((d["chat"], d["user"]))
 
     user = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
     await user.connect()
@@ -849,6 +1007,8 @@ async def main():
     log.info("System ready: %s banned ids, %s chats", len(BANNED), len(MODERATED))
 
     asyncio.create_task(scan_all("startup"))
+    asyncio.create_task(startup_prep())
+    asyncio.create_task(preban_worker())
     asyncio.create_task(refresh_loop())
     asyncio.create_task(pending_loop())
     asyncio.create_task(report_loop())
