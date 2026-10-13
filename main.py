@@ -327,7 +327,7 @@ async def scan_all(reason: str, quiet: bool = False):
             rows.append(b(f"• {ent.title}: checked {c}, banned {bn}, declined {dc}"))
         STATE["last_scan"] = time.time()
         if not quiet or total:
-            await send_log("\n".join([b(f"✅ Scan finished ({int(time.time() - t0)}s)")] + rows))
+            await send_log_lines(b(f"✅ Scan finished ({int(time.time() - t0)}s)"), rows)
 
 
 async def ent_label(uid: int) -> str:
@@ -586,38 +586,76 @@ async def export_list(event):
     await bot.send_file(event.chat_id, f, caption=b(f"📥 Banned list: {len(ids)} IDs"), parse_mode="html", buttons=[MENU_BTN])
 
 
-async def chats_screen(event):
-    if MODERATED:
-        lines = [b(f"🟢 Active chats: {len(MODERATED)}")] + [f"{b(e.title)} {code(c)}" for c, e in MODERATED.items()]
-        text = "\n".join(lines)
+PAGE = 10  # chats per page (Telegram allows max ~100 buttons per message)
+
+
+def nav_row(page: int, pages: int, prefix: str) -> list:
+    if pages <= 1:
+        return []
+    row = []
+    if page > 0:
+        row.append(Button.inline("◀️ Prev", f"{prefix}:{page - 1}".encode()))
+    row.append(Button.inline(f"{page + 1}/{pages}", b"noop"))
+    if page < pages - 1:
+        row.append(Button.inline("Next ▶️", f"{prefix}:{page + 1}".encode()))
+    return row
+
+
+def paginate(items: list, page: int):
+    pages = max(1, -(-len(items) // PAGE))
+    page = max(0, min(page, pages - 1))
+    return items[page * PAGE:(page + 1) * PAGE], page, pages
+
+
+async def chats_screen(event, page: int = 0):
+    items = list(MODERATED.items())
+    nav = []
+    if items:
+        chunk, page, pages = paginate(items, page)
+        title = f"🟢 Active chats: {len(items)}" + (f"  (page {page + 1}/{pages})" if pages > 1 else "")
+        text = "\n".join([b(title)] + [f"{b(e.title)} {code(c)}" for c, e in chunk])
+        nav = nav_row(page, pages, "chp")
     else:
         text = b("No active chats yet. Tap ➕ Add chat.")
-    buttons = [[Button.inline("➕ Add chat", b"add"), Button.inline("➖ Remove chat", b"remove")], MENU_BTN]
+    buttons = ([nav] if nav else []) + [
+        [Button.inline("➕ Add chat", b"add"), Button.inline("➖ Remove chat", b"remove")],
+        MENU_BTN,
+    ]
     await show(event, text, buttons)
 
 
-async def add_screen(event):
-    await refresh_chats(initial=True)  # pick up chats where the account just became admin
+async def add_screen(event, page: int = 0):
+    if page == 0:
+        await refresh_chats(initial=True)  # pick up chats where the account just became admin
+    cands = [(c, e) for c, e in CANDIDATES.items() if c not in ENABLED and c not in HIDDEN]
+    chunk, page, pages = paginate(cands, page)
     rows = [
         [Button.inline(e.title[:35], f"add:{c}".encode()), Button.inline("🗑", f"hide:{c}".encode())]
-        for c, e in CANDIDATES.items()
-        if c not in ENABLED and c not in HIDDEN
+        for c, e in chunk
     ]
-    if rows:
+    nav = nav_row(page, pages, "addp")
+    if nav:
+        rows.append(nav)
+    if cands:
         text = b("Tap a chat to activate it. 🗑 hides it from this list forever:")
     else:
         text = b("No chats found. Make the account an admin there (Ban users right), then tap again.")
     if HIDDEN:
         rows.append([Button.inline("♻️ Show hidden chats", b"unhide")])
     rows.append([Button.inline("⬅️ Back", b"chats")])
-    await show(event, text, rows[:50])
+    await show(event, text, rows)
 
 
-async def remove_screen(event):
-    rows = [[Button.inline(t[:35], f"rm:{c}".encode())] for c, t in ENABLED.items()]
-    text = b("Which chat should be deactivated? Tap one:") if rows else b("No active chats.")
+async def remove_screen(event, page: int = 0):
+    items = list(ENABLED.items())
+    chunk, page, pages = paginate(items, page)
+    rows = [[Button.inline(t[:35], f"rm:{c}".encode())] for c, t in chunk]
+    nav = nav_row(page, pages, "rmp")
+    if nav:
+        rows.append(nav)
+    text = b("Which chat should be deactivated? Tap one:") if items else b("No active chats.")
     rows.append([Button.inline("⬅️ Back", b"chats")])
-    await show(event, text, rows[:50])
+    await show(event, text, rows)
 
 
 async def enable_chat(event, cid: int):
@@ -733,13 +771,17 @@ async def unban_in_chat(ent, ids):
     await send_log_lines(b(f"🔓 Exception - unbanned in {ent.title}:"), lines)
 
 
-async def exc_chats_screen(event):
+async def exc_chats_screen(event, page: int = 0):
     if not MODERATED:
         return await show(event, b("No active chats yet. Add a chat first."), [MENU_BTN])
+    chunk, page, pages = paginate(list(MODERATED.items()), page)
     rows = [
         [Button.inline(f"{e.title[:28]} ({len(EXEMPT.get(c, ()))})", f"exc:{c}".encode())]
-        for c, e in MODERATED.items()
+        for c, e in chunk
     ]
+    nav = nav_row(page, pages, "excp")
+    if nav:
+        rows.append(nav)
     rows.append(MENU_BTN)
     text = "\n".join(
         [
@@ -748,7 +790,7 @@ async def exc_chats_screen(event):
             b("Pick a chat:"),
         ]
     )
-    await show(event, text, rows[:50])
+    await show(event, text, rows)
 
 
 async def exc_chat_screen(event, cid: int, note: str = ""):
@@ -912,6 +954,16 @@ async def on_callback(event):
         await remove_screen(event)
     elif data == "unhide":
         await unhide_all(event)
+    elif data == "noop":
+        pass
+    elif data.startswith("chp:"):
+        await chats_screen(event, int(data[4:]))
+    elif data.startswith("addp:"):
+        await add_screen(event, int(data[5:]))
+    elif data.startswith("rmp:"):
+        await remove_screen(event, int(data[4:]))
+    elif data.startswith("excp:"):
+        await exc_chats_screen(event, int(data[5:]))
     elif data == "exc":
         await exc_chats_screen(event)
     elif data.startswith("exc:"):
@@ -1003,7 +1055,7 @@ async def main():
     bot.add_event_handler(on_callback, events.CallbackQuery(func=lambda e: e.sender_id in OWNER_IDS))
 
     chat_lines = [b(f"• {e.title}") for e in MODERATED.values()] or [b("• (no active chats - open Chats > Add chat in the bot)")]
-    await send_log("\n".join([b("🟢 System online"), b(f"Banned IDs: {len(BANNED)}"), b(f"Chats: {len(MODERATED)}")] + chat_lines))
+    await send_log_lines("\n".join([b("🟢 System online"), b(f"Banned IDs: {len(BANNED)}"), b(f"Chats: {len(MODERATED)}")]), chat_lines)
     log.info("System ready: %s banned ids, %s chats", len(BANNED), len(MODERATED))
 
     asyncio.create_task(scan_all("startup"))
