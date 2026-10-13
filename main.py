@@ -51,6 +51,8 @@ HASHES: dict[int, int] = {}  # banned user id -> access_hash learned by the acco
 DONE: set = set()  # (chat id, user id) pairs already banned by us, so work is never repeated
 PREBAN_Q = None  # users whose hash was just learned -> banned in all other chats
 RESOLVE = {"running": False}
+LAST_ERR = {"ban": "", "decline": ""}  # last error name, shown in the log channel
+RECENT: dict = {}  # (chat id, user id) -> time we last handled a join request (avoids repeats)
 WARNED: dict = {}
 STATE = {"last_scan": 0, "started": time.time()}
 SCAN_LOCK = None
@@ -205,7 +207,7 @@ def remember(u):
 
 async def ban(entity, target) -> str:
     """target = User object or int id. Returns ok / invalid / forbidden / fail."""
-    uid = target if isinstance(target, int) else getattr(target, "id", None)
+    uid = target if isinstance(target, int) else (getattr(target, "id", None) or getattr(target, "user_id", None))
     if isinstance(target, int) and target in HASHES:
         target = types.InputPeerUser(target, HASHES[target])  # known hash: works even if never joined
     for _ in range(3):
@@ -216,26 +218,32 @@ async def ban(entity, target) -> str:
         except errors.FloodWaitError as e:
             warn_once(("flood", entity.id), b(f"⏳ Telegram rate limit (FloodWait {e.seconds}s) - {entity.title}"), 600)
             await asyncio.sleep(e.seconds + 1)
-        except (ValueError, errors.UserIdInvalidError, errors.PeerIdInvalidError):
+        except (ValueError, errors.UserIdInvalidError, errors.PeerIdInvalidError) as e:
+            LAST_ERR["ban"] = type(e).__name__
             return "invalid"  # id not known to the account yet
-        except (errors.ChatAdminRequiredError, errors.ChatWriteForbiddenError):
+        except (errors.ChatAdminRequiredError, errors.ChatWriteForbiddenError) as e:
+            LAST_ERR["ban"] = type(e).__name__
             warn_once(("noright", entity.id), b(f"⚠️ No ban rights in: {entity.title}"))
             return "forbidden"
         except Exception as e:
+            LAST_ERR["ban"] = f"{type(e).__name__}: {str(e)[:80]}"
             log.warning("ban failed in %s: %s", entity.title, e)
             return "fail"
     return "fail"
 
 
-async def decline(entity, target):
+async def decline(entity, target) -> bool:
     try:
         await user(
             functions.messages.HideChatJoinRequestRequest(
                 peer=entity, user_id=utils.get_input_user(target), approved=False
             )
         )
+        return True
     except Exception as e:
+        LAST_ERR["decline"] = type(e).__name__
         log.warning("decline failed: %s", e)
+        return False
 
 
 async def fetch_pending(entity) -> list:
@@ -276,16 +284,36 @@ async def process_pending(entity) -> int:
         log.warning("pending fetch failed in %s: %s", entity.title, e)
         return 0
     n = 0
+    now = time.time()
     for u in users:
         remember(u)
-        if is_target(entity, u.id):
-            await decline(entity, u)
-            await ban(entity, u)
+        if not is_target(entity, u.id):
+            continue
+        key = (utils.get_peer_id(entity), u.id)
+        if now - RECENT.get(key, 0) < 600:
+            continue  # handled a moment ago (request may still show as pending)
+        RECENT[key] = now
+        res = await ban(entity, u)  # ban first: even if declining fails, the user is out
+        if res != "ok":
+            await asyncio.sleep(3)
+            try:  # one retry with the input peer cached from the request list
+                res = await ban(entity, await user.get_input_entity(u.id))
+            except Exception:
+                pass
+        declined = await decline(entity, u)
+        where = b("in " + entity.title)
+        if res == "ok":
             n += 1
-            await bump("declined")
             await bump("bans")
-            await send_log(f"{b('🚫 Join request declined + banned:')} {label(u)} {b('in ' + entity.title)}")
-            await asyncio.sleep(RATE_DELAY)
+            if declined:
+                await bump("declined")
+                await send_log(f"{b('🚫 Join request declined + banned:')} {label(u)} {where}")
+            else:
+                await send_log(f"{b('🚫 Banned (request could not be declined: ' + LAST_ERR['decline'] + '):')} {label(u)} {where}")
+        else:
+            state = "declined" if declined else "NOT declined"
+            await send_log(f"{b('⚠️ Join request ' + state + ' but NOT banned (' + LAST_ERR['ban'] + '):')} {label(u)} {where}")
+        await asyncio.sleep(RATE_DELAY)
     return n
 
 
