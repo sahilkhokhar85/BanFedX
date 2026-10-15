@@ -16,6 +16,7 @@ import os
 import re
 import time
 
+import httpx
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import UpdateOne
 from telethon import Button, TelegramClient, errors, events, functions, types, utils
@@ -23,6 +24,8 @@ from telethon.sessions import StringSession
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 logging.getLogger("telethon").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)  # httpx would print the bot token
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("system")
 
 API_ID = int(os.environ["API_ID"])
@@ -53,6 +56,9 @@ PREBAN_Q = None  # users whose hash was just learned -> banned in all other chat
 RESOLVE = {"running": False}
 LAST_ERR = {"ban": "", "decline": ""}  # last error name, shown in the log channel
 RECENT: dict = {}  # (chat id, user id) -> time we last handled a join request (avoids repeats)
+HTTP = None  # Bot API client (fallback pre-ban through the bot)
+BOT_SKIP: dict = {}  # chat id -> time; chats where the bot has no ban rights (not retried for an hour)
+BOT_INVALID: set = set()  # ids the Bot API cannot resolve either
 WARNED: dict = {}
 STATE = {"last_scan": 0, "started": time.time()}
 SCAN_LOCK = None
@@ -107,7 +113,16 @@ def is_target(entity, uid: int) -> bool:
 
 
 def parse_ids(text: str) -> list[int]:
-    return list({int(x) for x in re.findall(r"(?<!\d)\d{5,11}(?!\d)", text or "")})
+    text = re.sub(r"@\w+", " ", text or "")  # usernames can contain digits, never treat them as ids
+    return list({int(x) for x in re.findall(r"(?<!\d)\d{5,11}(?!\d)", text)})
+
+
+def parse_pairs(text: str) -> dict:
+    """'123456789 @name' pairs -> {123456789: 'name'}"""
+    out = {}
+    for m in re.finditer(r"(?<!\d)(\d{5,11})(?!\d)\s*[,:\-]?\s*@([A-Za-z0-9_]{4,32})", text or ""):
+        out[int(m.group(1))] = m.group(2)
+    return out
 
 
 # ======================= logging to the log channel =======================
@@ -184,6 +199,39 @@ async def refresh_chats(initial: bool = False):
 
 
 # ======================= engine: actions =======================
+async def bot_api_ban(cid: int, uid: int) -> str:
+    """Fallback pre-ban through the Bot API. Works for ids the Bot API can resolve, in chats where the
+    bot is admin with Ban rights. Returns ok / invalid / skip / fail."""
+    if HTTP is None or uid in BOT_INVALID or time.time() - BOT_SKIP.get(cid, 0) < 3600:
+        return "skip"
+    for _ in range(2):
+        try:
+            r = await HTTP.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/banChatMember",
+                json={"chat_id": cid, "user_id": uid, "revoke_messages": False},
+            )
+            data = r.json()
+        except Exception as e:
+            LAST_ERR["botapi"] = type(e).__name__
+            return "fail"
+        if data.get("ok"):
+            return "ok"
+        desc = (data.get("description") or "").lower()
+        if r.status_code == 429:
+            await asyncio.sleep((data.get("parameters") or {}).get("retry_after", 5) + 1)
+            continue
+        if "participant_id_invalid" in desc or "user not found" in desc or "user_id_invalid" in desc:
+            BOT_INVALID.add(uid)
+            return "invalid"
+        if any(k in desc for k in ("not enough rights", "administrator rights", "chat_admin_required",
+                                   "chat not found", "not a member", "was kicked")):
+            BOT_SKIP[cid] = time.time()
+            return "skip"
+        LAST_ERR["botapi"] = desc[:80]
+        return "fail"
+    return "fail"
+
+
 async def mark_done(entity, uid):
     cid = utils.get_peer_id(entity)
     if uid is None or (cid, uid) in DONE:
@@ -200,6 +248,7 @@ def remember(u):
     if uid in BANNED and h and not getattr(u, "min", False) and HASHES.get(uid) != h:
         is_new = uid not in HASHES
         HASHES[uid] = h
+        BOT_INVALID.discard(uid)
         asyncio.create_task(db.banned.update_one({"_id": uid}, {"$set": {"hash": h}}))
         if is_new and PREBAN_Q is not None:
             PREBAN_Q.put_nowait(uid)
@@ -220,7 +269,10 @@ async def ban(entity, target) -> str:
             await asyncio.sleep(e.seconds + 1)
         except (ValueError, errors.UserIdInvalidError, errors.PeerIdInvalidError) as e:
             LAST_ERR["ban"] = type(e).__name__
-            return "invalid"  # id not known to the account yet
+            if uid and await bot_api_ban(utils.get_peer_id(entity), uid) == "ok":  # try through the bot
+                await mark_done(entity, uid)
+                return "ok"
+            return "invalid"  # unknown to the account (and to the bot)
         except (errors.ChatAdminRequiredError, errors.ChatWriteForbiddenError) as e:
             LAST_ERR["ban"] = type(e).__name__
             warn_once(("noright", entity.id), b(f"⚠️ No ban rights in: {entity.title}"))
@@ -367,25 +419,28 @@ async def ent_label(uid: int) -> str:
 
 
 async def ban_ids(ids, detail: bool = True):
-    """Ban every id the account can resolve, in every active chat. Works even if the user never joined
-    (pre-ban). Pairs already done are skipped. detail=False posts one summary line instead of names."""
+    """Ban every id in every active chat, even if the user never joined (pre-ban): through the account
+    (stored hash) or, failing that, through the bot. Pairs already done are skipped.
+    detail=False posts one summary line instead of names. Returns (bans done, set of ids that failed)."""
     ok = 0
     invalid = set()
+    attempted = set()
+    succeeded = set()
     for ent in list(MODERATED.values()):
         cid = utils.get_peer_id(ent)
         lines = []
         for uid in ids:
-            if not is_target(ent, uid) or (cid, uid) in DONE:
+            if not is_target(ent, uid) or (cid, uid) in DONE or uid in invalid:
                 continue
-            if uid in invalid:
-                continue
+            attempted.add(uid)
             res = await ban(ent, uid)
             if res == "ok":
                 ok += 1
+                succeeded.add(uid)
                 if detail:
                     lines.append("• " + await ent_label(uid))
-            elif res == "invalid":
-                invalid.add(uid)
+            elif res == "invalid" and uid in BOT_INVALID:
+                invalid.add(uid)  # unknown to the account AND to the Bot API: stop trying elsewhere
             if res != "invalid":
                 await asyncio.sleep(RATE_DELAY)
         if lines:
@@ -394,7 +449,7 @@ async def ban_ids(ids, detail: bool = True):
     if ok and not detail:
         await bump("bans", ok)
         await send_log(b(f"🛡 Pre-ban: {ok} new ban(s) done in the background"))
-    return ok, len(invalid)
+    return ok, attempted - succeeded
 
 
 # ---------- usernames -> access hashes (so IDs can be pre-banned) ----------
@@ -731,6 +786,8 @@ async def ask_ids(event, mode: str):
     AWAIT[event.sender_id] = mode
     what = "ban" if mode == "ban" else "unban"
     text = b(f"Send the user ID(s) to {what} (one or many, separated by space or new line). A .txt file works too.")
+    if mode == "ban":
+        text += "\n" + b("Tip: add the @username after an ID (e.g. 123456789 @name) so he can be banned even if he never joined.")
     await show(event, text, [[Button.inline("❌ Cancel", b"menu")]])
 
 
@@ -762,9 +819,17 @@ async def do_ban(event, ids):
     await show(event, "\n\n".join(parts), [[Button.inline("🚫 Ban more", b"ban")], MENU_BTN])
 
     async def job():
-        ok, unresolved = await ban_ids(new)
+        ok, failed = await ban_ids(new)
         await scan_all("after ban")
-        await send_log(b(f"✅ Ban finished: {ok} ban(s) done, {unresolved} ID(s) not resolvable yet (caught on request, join or scan)"))
+        pending = sorted(i for i in failed if i not in HASHES)
+        text = b(f"✅ Ban finished: {ok} ban(s) done")
+        if pending:
+            text += "\n" + b(
+                f"⚠️ {len(pending)} ID(s) cannot be banned yet: Telegram does not let this account or the bot find them. "
+                "They are banned automatically the moment they send a join request, join, or show up in a scan. "
+                "To ban them now, send the ID with the @username (e.g. 123456789 @name)."
+            ) + "\n" + " ".join(code(i) for i in pending[:30])
+        await send_log(text)
 
     asyncio.create_task(job())
 
@@ -894,6 +959,14 @@ async def del_exception(event, cid: int, uid: int):
     await exc_chat_screen(event, cid, note=b("✅ Exception removed. This user is banned in this chat again."))
 
 
+async def save_text_usernames(text: str):
+    """'123456789 @name' -> remember the username so the account can look the user up and pre-ban him."""
+    names = parse_pairs(text)
+    if names:
+        await save_usernames(names)
+        asyncio.create_task(resolve_usernames())
+
+
 async def dispatch_ids(event, mode, ids):
     if mode == "unban":
         return await do_unban(event, ids)
@@ -922,13 +995,19 @@ async def on_command(event):
     m = re.match(r"^/(\w+)(?:@\w+)?\s*(.*)$", text, re.S)
     if not m:  # plain message: if we asked for ids, use them, otherwise just show the menu
         if mode:
-            ids = parse_ids(text)
-            return await dispatch_ids(event, mode, ids)
+            await dispatch_ids(event, mode, parse_ids(text))
+            if mode == "ban":
+                await save_text_usernames(text)
+            return
         return await menu(event)
 
     cmd, ids = m.group(1).lower(), parse_ids(m.group(2))
     if cmd == "ban":
-        await (do_ban(event, ids) if ids else ask_ids(event, "ban"))
+        if ids:
+            await do_ban(event, ids)
+            await save_text_usernames(m.group(2))
+        else:
+            await ask_ids(event, "ban")
     elif cmd == "unban":
         await (do_unban(event, ids) if ids else ask_ids(event, "unban"))
     elif cmd == "check" and ids:
@@ -1046,7 +1125,8 @@ async def report_loop():
 
 # ======================= start =======================
 async def main():
-    global user, bot, db, SCAN_LOCK, PREBAN_Q
+    global user, bot, db, SCAN_LOCK, PREBAN_Q, HTTP
+    HTTP = httpx.AsyncClient(timeout=20)
     SCAN_LOCK = asyncio.Lock()
     PREBAN_Q = asyncio.Queue()
     db = AsyncIOMotorClient(MONGO_URI)[MONGO_DB]
