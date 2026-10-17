@@ -59,6 +59,7 @@ LAST_ERR = {"ban": "", "decline": ""}  # last error name, shown in the log chann
 RECENT: dict = {}  # (chat id, user id) -> time we last handled a join request (avoids repeats)
 HTTP = None  # Bot API client (fallback pre-ban through the bot)
 CLEAN = {"on": True}  # deleted-account cleanup is always on (no switch)
+CLEARED: dict = {}  # chat id -> deleted-account request ids already cleared once (detects "Telegram keeps them")
 KICK_PER_SCAN = 50  # max deleted accounts kicked per chat per scan (the rest follows in the next scan)
 BOT_SKIP: dict = {}  # chat id -> time; chats where the bot has no ban rights (not retried for an hour)
 BOT_INVALID: set = set()  # ids the Bot API cannot resolve either
@@ -349,6 +350,34 @@ async def kick_deleted(entity, u) -> bool:
     return False
 
 
+async def clear_deleted_requests(entity, deleted_pending: list, others: int):
+    """Telegram refuses to decline a deleted account's request one by one (InputUserDeactivated).
+    The only way is 'decline all', and that is done ONLY when no real request is waiting."""
+    cid = utils.get_peer_id(entity)
+    ids = {u.id for u in deleted_pending}
+    if ids <= CLEARED.get(cid, set()):
+        warn_once(("del-stuck", cid), b(f"⚠️ {entity.title}: Telegram keeps {len(ids)} deleted-account request(s) even after clearing - remove them in the app"), 86400)
+        return
+    if others:
+        warn_once(("del-mixed", cid), b(f"ℹ️ {entity.title}: {len(ids)} deleted-account request(s) wait together with real requests; they are cleared automatically once no real request is waiting"), 6 * 3600)
+        return
+    key = (cid, "deleted")
+    if time.time() - RECENT.get(key, 0) < 600:
+        return
+    RECENT[key] = time.time()
+    try:  # re-check right before: only deleted accounts and listed users may be waiting
+        fresh = await fetch_pending(entity)
+        if any(not (getattr(x, "deleted", False) and x.id not in BANNED) and not is_target(entity, x.id) for x in fresh):
+            return
+        await user(functions.messages.HideAllChatJoinRequestsRequest(peer=entity, approved=False))
+    except Exception as e:
+        warn_once(("del-all", cid), b(f"⚠️ {entity.title}: could not clear deleted-account requests ({type(e).__name__})"))
+        return
+    CLEARED.setdefault(cid, set()).update(ids)
+    await bump("cleaned", len(ids))
+    await send_log(b(f"🧹 Cleared {len(ids)} deleted-account join request(s) in {entity.title}"))
+
+
 async def process_pending(entity) -> int:
     """Decline + ban banned users waiting in the join-request queue. Returns how many."""
     try:
@@ -363,20 +392,16 @@ async def process_pending(entity) -> int:
         log.warning("pending fetch failed in %s: %s", entity.title, e)
         return 0
     n = 0
-    cleaned = 0
+    deleted_pending = []
+    others = 0  # real users waiting (not on the ban list, not deleted)
     now = time.time()
     for u in users:
         remember(u)
         if not is_target(entity, u.id):
             if CLEAN["on"] and getattr(u, "deleted", False) and u.id not in BANNED:
-                key = (utils.get_peer_id(entity), u.id)
-                if now - RECENT.get(key, 0) >= 600:
-                    RECENT[key] = now
-                    if await decline(entity, u):  # decline only - deleted accounts are never banned
-                        cleaned += 1
-                    else:
-                        warn_once(("decl-del", entity.id), b(f"⚠️ {entity.title}: could not decline a deleted account's request ({LAST_ERR['decline']})"))
-                    await asyncio.sleep(RATE_DELAY)
+                deleted_pending.append(u)  # never banned, only cleared (see clear_deleted_requests)
+            else:
+                others += 1
             continue
         key = (utils.get_peer_id(entity), u.id)
         if now - RECENT.get(key, 0) < 600:
@@ -403,16 +428,16 @@ async def process_pending(entity) -> int:
             state = "declined" if declined else "NOT declined"
             await send_log(f"{b('⚠️ Join request ' + state + ' but NOT banned (' + LAST_ERR['ban'] + '):')} {label(u)} {where}")
         await asyncio.sleep(RATE_DELAY)
-    if cleaned:
-        await bump("cleaned", cleaned)
-        await send_log(b(f"🧹 Declined {cleaned} deleted-account join request(s) in {entity.title}"))
+    if deleted_pending:
+        await clear_deleted_requests(entity, deleted_pending, others)
     return n
 
 
 async def scan_chat(entity):
-    """Pending requests + current members. Returns (checked, banned, declined, kicked)."""
+    """Pending requests + current members. Returns (checked, banned, declined, kicked, deleted_seen)."""
     declined = await process_pending(entity)
-    checked = banned = kicked = deleted_seen = 0
+    checked = banned = kicked = 0
+    deleted_ids = set()
     lines = []
     try:
         async for u in user.iter_participants(entity):
@@ -423,11 +448,18 @@ async def scan_chat(entity):
                     banned += 1
                     lines.append("• " + label(u))
                 await asyncio.sleep(RATE_DELAY)
-            elif CLEAN["on"] and getattr(u, "deleted", False) and u.id not in BANNED:
-                deleted_seen += 1  # deleted account: plain kick, never a ban
+            elif CLEAN["on"] and getattr(u, "deleted", False) and u.id not in BANNED and u.id not in deleted_ids:
+                deleted_ids.add(u.id)  # deleted account: plain kick, never a ban
                 if kicked < KICK_PER_SCAN and await kick_deleted(entity, u):
                     kicked += 1
                     await asyncio.sleep(RATE_DELAY)
+        if CLEAN["on"]:  # deleted accounts can be missing from the normal list: also walk the 'recent' list
+            async for u in user.iter_participants(entity, limit=5000, filter=types.ChannelParticipantsRecent):
+                if getattr(u, "deleted", False) and u.id not in BANNED and u.id not in deleted_ids:
+                    deleted_ids.add(u.id)
+                    if kicked < KICK_PER_SCAN and await kick_deleted(entity, u):
+                        kicked += 1
+                        await asyncio.sleep(RATE_DELAY)
     except errors.FloodWaitError as e:
         await asyncio.sleep(e.seconds + 1)
     except Exception as e:
@@ -436,10 +468,10 @@ async def scan_chat(entity):
         await bump("bans", banned)
     if kicked:
         await bump("cleaned", kicked)
-        more = f" ({deleted_seen - kicked} more in the next scan)" if deleted_seen > kicked else ""
+        more = f" ({len(deleted_ids) - kicked} more in the next scan)" if len(deleted_ids) > kicked else ""
         await send_log(b(f"🧹 Kicked {kicked} deleted account(s) in {entity.title}{more}"))
     await send_log_lines(b(f"🚫 Banned by scan - {entity.title}:"), lines)
-    return checked, banned, declined, kicked
+    return checked, banned, declined, kicked, len(deleted_ids)
 
 
 async def scan_all(reason: str, quiet: bool = False):
@@ -451,9 +483,9 @@ async def scan_all(reason: str, quiet: bool = False):
         rows = []
         total = 0
         for ent in list(MODERATED.values()):
-            c, bn, dc, kk = await scan_chat(ent)
+            c, bn, dc, kk, ds = await scan_chat(ent)
             total += bn + dc + kk
-            extra = f", kicked {kk}" if kk else ""
+            extra = f", deleted seen {ds}, kicked {kk}" if ds else ""
             rows.append(b(f"• {ent.title}: checked {c}, banned {bn}, declined {dc}{extra}"))
         STATE["last_scan"] = time.time()
         if not quiet or total:
