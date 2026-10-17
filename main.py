@@ -51,12 +51,15 @@ ENABLED: dict[int, str] = {}  # enabled chat id -> title (stored in MongoDB)
 HIDDEN: set[int] = set()  # chats you removed from the lists forever (stored in MongoDB)
 EXEMPT: dict[int, set[int]] = {}  # chat id -> users on the ban list who must NOT be banned in that chat
 HASHES: dict[int, int] = {}  # banned user id -> access_hash learned by the account (lets us pre-ban non-members)
+SEEN: dict[int, int] = {}  # ANY user who chatted privately with the account -> access_hash (kept in MongoDB)
 DONE: set = set()  # (chat id, user id) pairs already banned by us, so work is never repeated
 PREBAN_Q = None  # users whose hash was just learned -> banned in all other chats
 RESOLVE = {"running": False, "again": False}
 LAST_ERR = {"ban": "", "decline": ""}  # last error name, shown in the log channel
 RECENT: dict = {}  # (chat id, user id) -> time we last handled a join request (avoids repeats)
 HTTP = None  # Bot API client (fallback pre-ban through the bot)
+CLEAN = {"on": True}  # deleted-account cleanup is always on (no switch)
+KICK_PER_SCAN = 50  # max deleted accounts kicked per chat per scan (the rest follows in the next scan)
 BOT_SKIP: dict = {}  # chat id -> time; chats where the bot has no ban rights (not retried for an hour)
 BOT_INVALID: set = set()  # ids the Bot API cannot resolve either
 WARNED: dict = {}
@@ -257,8 +260,10 @@ def remember(u):
 async def ban(entity, target) -> str:
     """target = User object or int id. Returns ok / invalid / forbidden / fail."""
     uid = target if isinstance(target, int) else (getattr(target, "id", None) or getattr(target, "user_id", None))
-    if isinstance(target, int) and target in HASHES:
-        target = types.InputPeerUser(target, HASHES[target])  # known hash: works even if never joined
+    if isinstance(target, int):
+        h = HASHES.get(target) or SEEN.get(target)
+        if h:
+            target = types.InputPeerUser(target, h)  # known hash: works even if he never joined
     for _ in range(3):
         try:
             await user(functions.channels.EditBannedRequest(entity, target, FULL_BAN))
@@ -269,9 +274,11 @@ async def ban(entity, target) -> str:
             await asyncio.sleep(e.seconds + 1)
         except (ValueError, errors.UserIdInvalidError, errors.PeerIdInvalidError) as e:
             LAST_ERR["ban"] = type(e).__name__
-            if uid and await bot_api_ban(utils.get_peer_id(entity), uid) == "ok":  # try through the bot
-                await mark_done(entity, uid)
-                return "ok"
+            if uid:
+                LAST_ERR["bot"] = await bot_api_ban(utils.get_peer_id(entity), uid)  # try through the bot
+                if LAST_ERR["bot"] == "ok":
+                    await mark_done(entity, uid)
+                    return "ok"
             return "invalid"  # unknown to the account (and to the bot)
         except (errors.ChatAdminRequiredError, errors.ChatWriteForbiddenError) as e:
             LAST_ERR["ban"] = type(e).__name__
@@ -286,11 +293,11 @@ async def ban(entity, target) -> str:
 
 async def decline(entity, target) -> bool:
     try:
-        await user(
-            functions.messages.HideChatJoinRequestRequest(
-                peer=entity, user_id=utils.get_input_user(target), approved=False
-            )
-        )
+        if getattr(target, "deleted", False):  # deleted accounts carry no access_hash
+            target_in = types.InputUser(target.id, getattr(target, "access_hash", None) or 0)
+        else:
+            target_in = utils.get_input_user(target)
+        await user(functions.messages.HideChatJoinRequestRequest(peer=entity, user_id=target_in, approved=False))
         return True
     except Exception as e:
         LAST_ERR["decline"] = type(e).__name__
@@ -322,6 +329,26 @@ async def fetch_pending(entity) -> list:
     return users
 
 
+async def kick_deleted(entity, u) -> bool:
+    """Remove a deleted account WITHOUT blacklisting it: ban, then lift the ban right away (a plain kick).
+    Separate from ban(): never touches the ban list, DONE pairs or ban counters."""
+    peer = types.InputPeerUser(u.id, getattr(u, "access_hash", None) or 0)
+    for _ in range(2):
+        try:
+            await user(functions.channels.EditBannedRequest(entity, peer, FULL_BAN))
+            await user(functions.channels.EditBannedRequest(entity, peer, NO_BAN))
+            return True
+        except errors.FloodWaitError as e:
+            if e.seconds > 120:
+                return False
+            await asyncio.sleep(e.seconds + 1)
+        except Exception as e:
+            LAST_ERR["kick"] = type(e).__name__
+            warn_once(("kick", entity.id), b(f"⚠️ {entity.title}: could not kick a deleted account ({type(e).__name__})"))
+            return False
+    return False
+
+
 async def process_pending(entity) -> int:
     """Decline + ban banned users waiting in the join-request queue. Returns how many."""
     try:
@@ -336,10 +363,20 @@ async def process_pending(entity) -> int:
         log.warning("pending fetch failed in %s: %s", entity.title, e)
         return 0
     n = 0
+    cleaned = 0
     now = time.time()
     for u in users:
         remember(u)
         if not is_target(entity, u.id):
+            if CLEAN["on"] and getattr(u, "deleted", False) and u.id not in BANNED:
+                key = (utils.get_peer_id(entity), u.id)
+                if now - RECENT.get(key, 0) >= 600:
+                    RECENT[key] = now
+                    if await decline(entity, u):  # decline only - deleted accounts are never banned
+                        cleaned += 1
+                    else:
+                        warn_once(("decl-del", entity.id), b(f"⚠️ {entity.title}: could not decline a deleted account's request ({LAST_ERR['decline']})"))
+                    await asyncio.sleep(RATE_DELAY)
             continue
         key = (utils.get_peer_id(entity), u.id)
         if now - RECENT.get(key, 0) < 600:
@@ -366,13 +403,16 @@ async def process_pending(entity) -> int:
             state = "declined" if declined else "NOT declined"
             await send_log(f"{b('⚠️ Join request ' + state + ' but NOT banned (' + LAST_ERR['ban'] + '):')} {label(u)} {where}")
         await asyncio.sleep(RATE_DELAY)
+    if cleaned:
+        await bump("cleaned", cleaned)
+        await send_log(b(f"🧹 Declined {cleaned} deleted-account join request(s) in {entity.title}"))
     return n
 
 
 async def scan_chat(entity):
-    """Pending requests + current members. Returns (checked, banned, declined)."""
+    """Pending requests + current members. Returns (checked, banned, declined, kicked)."""
     declined = await process_pending(entity)
-    checked = banned = 0
+    checked = banned = kicked = deleted_seen = 0
     lines = []
     try:
         async for u in user.iter_participants(entity):
@@ -383,14 +423,23 @@ async def scan_chat(entity):
                     banned += 1
                     lines.append("• " + label(u))
                 await asyncio.sleep(RATE_DELAY)
+            elif CLEAN["on"] and getattr(u, "deleted", False) and u.id not in BANNED:
+                deleted_seen += 1  # deleted account: plain kick, never a ban
+                if kicked < KICK_PER_SCAN and await kick_deleted(entity, u):
+                    kicked += 1
+                    await asyncio.sleep(RATE_DELAY)
     except errors.FloodWaitError as e:
         await asyncio.sleep(e.seconds + 1)
     except Exception as e:
         warn_once(("scan", entity.id), b(f"⚠️ {entity.title}: member scan failed ({type(e).__name__})"))
     if banned:
         await bump("bans", banned)
+    if kicked:
+        await bump("cleaned", kicked)
+        more = f" ({deleted_seen - kicked} more in the next scan)" if deleted_seen > kicked else ""
+        await send_log(b(f"🧹 Kicked {kicked} deleted account(s) in {entity.title}{more}"))
     await send_log_lines(b(f"🚫 Banned by scan - {entity.title}:"), lines)
-    return checked, banned, declined
+    return checked, banned, declined, kicked
 
 
 async def scan_all(reason: str, quiet: bool = False):
@@ -402,12 +451,23 @@ async def scan_all(reason: str, quiet: bool = False):
         rows = []
         total = 0
         for ent in list(MODERATED.values()):
-            c, bn, dc = await scan_chat(ent)
-            total += bn + dc
-            rows.append(b(f"• {ent.title}: checked {c}, banned {bn}, declined {dc}"))
+            c, bn, dc, kk = await scan_chat(ent)
+            total += bn + dc + kk
+            extra = f", kicked {kk}" if kk else ""
+            rows.append(b(f"• {ent.title}: checked {c}, banned {bn}, declined {dc}{extra}"))
         STATE["last_scan"] = time.time()
         if not quiet or total:
             await send_log_lines(b(f"✅ Scan finished ({int(time.time() - t0)}s)"), rows)
+
+
+def why_cannot() -> str:
+    acct = "this account has never seen him" if LAST_ERR["ban"] in ("ValueError", "") else LAST_ERR["ban"]
+    bot_note = {
+        "skip": "the bot is not admin in that chat",
+        "invalid": "the bot does not know him either",
+        "fail": "the bot call failed",
+    }.get(LAST_ERR.get("bot"), "")
+    return acct + (f"; {bot_note}" if bot_note else "")
 
 
 async def ent_label(uid: int) -> str:
@@ -612,13 +672,22 @@ async def on_pending_update(update):
 
 
 async def on_private_message(event):
-    """A private chat with a listed user (he writes to the account, or you message him from it) teaches the
-    account his access hash. He can then be banned in every chat, even where he never joined."""
-    if event.chat_id in BANNED:
-        try:
-            remember(await event.get_chat())
-        except Exception:
-            pass
+    """Any private chat with a user (he writes to the account, or the account messages him) teaches the account
+    his access hash (only id + hash are kept, in MongoDB). If he is, or later gets, on the ban list he can be
+    banned in every chat even if he never joined - the order of 'message him' and '/ban' does not matter."""
+    try:
+        u = await event.get_chat()
+    except Exception:
+        return
+    uid = getattr(u, "id", None)
+    h = getattr(u, "access_hash", None)
+    if not uid or not h or getattr(u, "min", False) or getattr(u, "is_self", False):
+        return
+    if SEEN.get(uid) != h:
+        SEEN[uid] = h
+        asyncio.create_task(db.seen.update_one({"_id": uid}, {"$set": {"hash": h}}, upsert=True))
+    if uid in BANNED:
+        remember(u)
 
 
 async def on_chat_action(event):
@@ -705,6 +774,7 @@ def stats_text(s: dict) -> str:
         ("Unbans", str(s.get("unbans", 0))),
         ("Exceptions", str(sum(len(v) for v in EXEMPT.values()))),
         ("Pre-bannable IDs", f"{sum(1 for i in HASHES if i in BANNED)}/{len(BANNED)}"),
+        ("Deleted cleaned", str(s.get("cleaned", 0))),
         ("Last scan", last_scan_text()),
         ("Uptime", f"{up // 60}h {up % 60}m"),
     ]
@@ -886,6 +956,10 @@ async def do_ban(event, ids, names=None):
             [UpdateOne({"_id": i}, {"$setOnInsert": {"added_at": now}}, upsert=True) for i in new]
         )
         BANNED.update(new)
+        for i in new:  # already met this user in a private chat? then his hash is known
+            if i in SEEN and i not in HASHES:
+                HASHES[i] = SEEN[i]
+                await db.banned.update_one({"_id": i}, {"$set": {"hash": SEEN[i]}})
         skipped = f", {len(already)} already listed" if already else ""
         await send_log(f"{b('📝 Ban command:')} {label(sender)} {b(f'- {len(new)} new ID(s){skipped}')}")
     if names:
@@ -903,9 +977,10 @@ async def do_ban(event, ids, names=None):
         text = b(f"✅ Ban finished: {ok} ban(s) done")
         if pending:
             text += "\n" + b(
-                f"⚠️ {len(pending)} ID(s) cannot be banned yet (last error: {LAST_ERR['ban'] or 'unknown id'}). "
+                f"⚠️ {len(pending)} ID(s) cannot be banned yet ({why_cannot()}). "
                 "They are banned automatically the moment they send a join request, join, or show up in a scan. "
-                "To ban them now, send the ID with the correct @username (e.g. 123456789 @name)."
+                "To ban them now, send the ID with his @username (e.g. 123456789 @name). "
+                "Do not message strangers from the account: Telegram limits accounts that get reported."
             ) + "\n" + " ".join(code(i) for i in pending[:30])
         await send_log(text)
         if names:  # the owner also gets the result here, not only in the log channel
@@ -1212,6 +1287,8 @@ async def main():
         HASHES[d["_id"]] = d["hash"]
     async for d in db.done.find():
         DONE.add((d["chat"], d["user"]))
+    async for d in db.seen.find():
+        SEEN[d["_id"]] = d["hash"]
 
     user = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
     await user.connect()
