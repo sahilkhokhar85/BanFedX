@@ -640,7 +640,7 @@ SVC_ACTIONS = tuple(  # looked up by name, so a missing class in some Telethon v
 
 
 async def on_service_message(update):
-    """'X joined', 'X was added', 'X left', 'X was removed' messages in active GROUPS are queued for deletion."""
+    """'X joined', 'X was added', 'X left', 'X was removed' messages in active GROUPS are deleted right away."""
     msg = update.message
     if not isinstance(msg, types.MessageService) or not isinstance(msg.action, SVC_ACTIONS):
         return
@@ -648,13 +648,22 @@ async def on_service_message(update):
     ent = MODERATED.get(cid)
     if ent is None or not getattr(ent, "megagroup", False):
         return  # channels have no such messages; only active groups are tidied
-    SVC_PENDING.setdefault(cid, []).append(msg.id)
+    try:
+        await user.delete_messages(ent, [msg.id])  # immediately, no waiting
+        asyncio.create_task(bump("svc"))
+    except errors.FloodWaitError:
+        SVC_PENDING.setdefault(cid, []).append(msg.id)  # Telegram asked to slow down: the loop below retries
+    except Exception as e:
+        warn_once(
+            ("svc", cid),
+            b(f"⚠️ {ent.title}: cannot delete join/leave messages ({type(e).__name__}) - the account needs the Delete messages right"),
+        )
 
 
 async def svc_flush_loop():
-    """Deletes the queued join/leave messages in batches (one request can delete up to 100)."""
+    """Retries messages that could not be deleted at once (only after a Telegram FloodWait)."""
     while True:
-        await asyncio.sleep(3)
+        await asyncio.sleep(1)
         for cid, ids in list(SVC_PENDING.items()):
             if not ids:
                 continue
