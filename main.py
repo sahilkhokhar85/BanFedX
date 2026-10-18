@@ -56,6 +56,7 @@ DONE: set = set()  # (chat id, user id) pairs already banned by us, so work is n
 PREBAN_Q = None  # users whose hash was just learned -> banned in all other chats
 RESOLVE = {"running": False, "again": False}
 LAST_ERR = {"ban": "", "decline": ""}  # last error name, shown in the log channel
+SVC_PENDING: dict = {}  # group chat id -> ids of join/leave service messages waiting to be deleted
 RECENT: dict = {}  # (chat id, user id) -> time we last handled a join request (avoids repeats)
 HTTP = None  # Bot API client (fallback pre-ban through the bot)
 BOT_SKIP: dict = {}  # chat id -> time; chats where the bot has no ban rights (not retried for an hour)
@@ -626,6 +627,57 @@ async def on_pending_update(update):
         await process_pending(ent)
 
 
+SVC_ACTIONS = tuple(  # looked up by name, so a missing class in some Telethon version can never stop the start
+    getattr(types, n)
+    for n in (
+        "MessageActionChatJoinedByLink",
+        "MessageActionChatJoinedByRequest",
+        "MessageActionChatAddUser",
+        "MessageActionChatDeleteUser",
+    )
+    if hasattr(types, n)
+)
+
+
+async def on_service_message(update):
+    """'X joined', 'X was added', 'X left', 'X was removed' messages in active GROUPS are queued for deletion."""
+    msg = update.message
+    if not isinstance(msg, types.MessageService) or not isinstance(msg.action, SVC_ACTIONS):
+        return
+    cid = utils.get_peer_id(msg.peer_id)
+    ent = MODERATED.get(cid)
+    if ent is None or not getattr(ent, "megagroup", False):
+        return  # channels have no such messages; only active groups are tidied
+    SVC_PENDING.setdefault(cid, []).append(msg.id)
+
+
+async def svc_flush_loop():
+    """Deletes the queued join/leave messages in batches (one request can delete up to 100)."""
+    while True:
+        await asyncio.sleep(3)
+        for cid, ids in list(SVC_PENDING.items()):
+            if not ids:
+                continue
+            ent = MODERATED.get(cid)
+            if ent is None:
+                SVC_PENDING.pop(cid, None)
+                continue
+            batch = ids[:100]
+            del ids[:100]
+            try:
+                await user.delete_messages(ent, batch)
+                await bump("svc", len(batch))
+            except errors.FloodWaitError as e:
+                ids[:0] = batch  # try again after the wait
+                await asyncio.sleep(e.seconds + 1)
+            except Exception as e:
+                warn_once(
+                    ("svc", cid),
+                    b(f"⚠️ {ent.title}: cannot delete join/leave messages ({type(e).__name__}) - the account needs the Delete messages right"),
+                )
+            await asyncio.sleep(0.5)
+
+
 async def on_private_message(event):
     """Any private chat with a user (he writes to the account, or the account messages him) teaches the account
     his access hash (only id + hash are kept, in MongoDB). If he is, or later gets, on the ban list he can be
@@ -729,6 +781,7 @@ def stats_text(s: dict) -> str:
         ("Unbans", str(s.get("unbans", 0))),
         ("Exceptions", str(sum(len(v) for v in EXEMPT.values()))),
         ("Pre-bannable IDs", f"{sum(1 for i in HASHES if i in BANNED)}/{len(BANNED)}"),
+        ("Join/leave msgs deleted", str(s.get("svc", 0))),
         ("Last scan", last_scan_text()),
         ("Uptime", f"{up // 60}h {up % 60}m"),
     ]
@@ -1259,6 +1312,7 @@ async def main():
 
     user.add_event_handler(on_pending_update, events.Raw(types.UpdatePendingJoinRequests))
     user.add_event_handler(on_chat_action, events.ChatAction)
+    user.add_event_handler(on_service_message, events.Raw(types.UpdateNewChannelMessage))
     user.add_event_handler(on_private_message, events.NewMessage(func=lambda e: e.is_private))
     bot.add_event_handler(
         on_command,
@@ -1273,6 +1327,7 @@ async def main():
     asyncio.create_task(scan_all("startup"))
     asyncio.create_task(startup_prep())
     asyncio.create_task(preban_worker())
+    asyncio.create_task(svc_flush_loop())
     asyncio.create_task(refresh_loop())
     asyncio.create_task(pending_loop())
     asyncio.create_task(report_loop())
