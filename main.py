@@ -39,6 +39,7 @@ LOG_ID = int(os.environ["LOG_CHAT_ID"])
 SEED_FILE = os.environ.get("SEED_FILE", "ids.txt")
 PENDING_SECONDS = int(os.environ.get("PENDING_SECONDS", "45"))  # backup poll for join requests
 SCAN_MINUTES = int(os.environ.get("SCAN_MINUTES", "30"))  # full member scan, 0 = off
+DEEP_SCAN_HOURS = int(os.environ.get("DEEP_SCAN_HOURS", "6"))  # deep scan (learn hashes), 0 = off
 RATE_DELAY = 0.7  # gentle pace for a real account
 
 user = None  # engine
@@ -60,7 +61,7 @@ SVC_PENDING: dict = {}  # group chat id -> ids of join/leave service messages wa
 RECENT: dict = {}  # (chat id, user id) -> time we last handled a join request (avoids repeats)
 HTTP = None  # Bot API client (fallback pre-ban through the bot)
 BOT_SKIP: dict = {}  # chat id -> time; chats where the bot has no ban rights (not retried for an hour)
-BOT_INVALID: set = set()  # ids the Bot API cannot resolve either
+BOT_INVALID: set = set()  # (chat id, user id) pairs the Bot API could not resolve (it may know him in another chat)
 WARNED: dict = {}
 STATE = {"last_scan": 0, "started": time.time()}
 SCAN_LOCK = None
@@ -204,7 +205,7 @@ async def refresh_chats(initial: bool = False):
 async def bot_api_ban(cid: int, uid: int) -> str:
     """Fallback pre-ban through the Bot API. Works for ids the Bot API can resolve, in chats where the
     bot is admin with Ban rights. Returns ok / invalid / skip / fail."""
-    if HTTP is None or uid in BOT_INVALID or time.time() - BOT_SKIP.get(cid, 0) < 3600:
+    if HTTP is None or (cid, uid) in BOT_INVALID or time.time() - BOT_SKIP.get(cid, 0) < 3600:
         return "skip"
     for _ in range(2):
         try:
@@ -223,7 +224,7 @@ async def bot_api_ban(cid: int, uid: int) -> str:
             await asyncio.sleep((data.get("parameters") or {}).get("retry_after", 5) + 1)
             continue
         if "participant_id_invalid" in desc or "user not found" in desc or "user_id_invalid" in desc:
-            BOT_INVALID.add(uid)
+            BOT_INVALID.add((cid, uid))
             return "invalid"
         if any(k in desc for k in ("not enough rights", "administrator rights", "chat_admin_required",
                                    "chat not found", "not a member", "was kicked")):
@@ -250,7 +251,7 @@ def remember(u):
     if uid in BANNED and h and not getattr(u, "min", False) and HASHES.get(uid) != h:
         is_new = uid not in HASHES
         HASHES[uid] = h
-        BOT_INVALID.discard(uid)
+        BOT_INVALID.difference_update({k for k in BOT_INVALID if k[1] == uid})
         asyncio.create_task(db.banned.update_one({"_id": uid}, {"$set": {"hash": h}}))
         if is_new and PREBAN_Q is not None:
             PREBAN_Q.put_nowait(uid)
@@ -399,6 +400,46 @@ async def scan_chat(entity):
     return checked, banned, declined
 
 
+async def deep_scan_chat(entity) -> int:
+    """Learn access hashes of listed users so they can be pre-banned in EVERY chat:
+    1) from the chat's Removed list (people already banned here), 2) from a letter-by-letter member search
+    that gets around Telegram's 200-member cap for accounts with a name or username."""
+    banned = 0
+    lines = []
+    try:
+        async for u in user.iter_participants(entity, filter=types.ChannelParticipantsKicked, limit=3000):
+            remember(u)
+        async for u in user.iter_participants(entity, aggressive=True):
+            remember(u)
+            if is_target(entity, u.id):
+                if await ban(entity, u) == "ok":
+                    banned += 1
+                    lines.append("• " + label(u))
+                await asyncio.sleep(RATE_DELAY)
+    except errors.FloodWaitError as e:
+        if e.seconds <= 300:
+            await asyncio.sleep(e.seconds + 1)
+    except Exception as e:
+        warn_once(("deep", entity.id), b(f"⚠️ {entity.title}: deep scan failed ({type(e).__name__})"))
+    if banned:
+        await bump("bans", banned)
+    await send_log_lines(b(f"🚫 Banned by deep scan - {entity.title}:"), lines)
+    return banned
+
+
+async def deep_scan_all(reason: str):
+    async with SCAN_LOCK:
+        before = sum(1 for i in HASHES if i in BANNED)
+        if reason == "manual":
+            await send_log(b(f"🔎 Deep scan started - {len(MODERATED)} chats"))
+        total = 0
+        for ent in list(MODERATED.values()):
+            total += await deep_scan_chat(ent)
+        after = sum(1 for i in HASHES if i in BANNED)
+        if reason == "manual" or after != before or total:
+            await send_log(b(f"✅ Deep scan finished: {after - before} newly known ID(s), {total} banned. Pre-bannable IDs: {after}/{len(BANNED)}"))
+
+
 async def scan_all(reason: str, quiet: bool = False):
     """quiet=True (auto scans): the log channel only hears about it when something was found."""
     async with SCAN_LOCK:
@@ -439,14 +480,13 @@ async def ban_ids(ids, detail: bool = True):
     (stored hash) or, failing that, through the bot. Pairs already done are skipped.
     detail=False posts one summary line instead of names. Returns (bans done, set of ids that failed)."""
     ok = 0
-    invalid = set()
     attempted = set()
     succeeded = set()
     for ent in list(MODERATED.values()):
         cid = utils.get_peer_id(ent)
         lines = []
         for uid in ids:
-            if not is_target(ent, uid) or (cid, uid) in DONE or uid in invalid:
+            if not is_target(ent, uid) or (cid, uid) in DONE:
                 continue
             attempted.add(uid)
             res = await ban(ent, uid)
@@ -455,8 +495,6 @@ async def ban_ids(ids, detail: bool = True):
                 succeeded.add(uid)
                 if detail:
                     lines.append("• " + await ent_label(uid))
-            elif res == "invalid" and uid in BOT_INVALID:
-                invalid.add(uid)  # unknown to the account AND to the Bot API: stop trying elsewhere
             if res != "invalid":
                 await asyncio.sleep(RATE_DELAY)
         if lines:
@@ -492,7 +530,7 @@ async def lookup(uid: int, uname: str):
     if not ent.access_hash:
         return "error", "no access hash"
     HASHES[uid] = ent.access_hash
-    BOT_INVALID.discard(uid)
+    BOT_INVALID.difference_update({k for k in BOT_INVALID if k[1] == uid})
     await db.banned.update_one({"_id": uid}, {"$set": {"hash": ent.access_hash}})
     return "ok", ""
 
@@ -775,7 +813,7 @@ async def menu(event):
         [Button.inline("🚫 Ban", b"ban"), Button.inline("✅ Unban", b"unban")],
         [Button.inline("📋 Chats", b"chats"), Button.inline("📊 Stats", b"stats")],
         [Button.inline("🔍 Scan now", b"scan"), Button.inline("📄 Banned list", b"list")],
-        [Button.inline("🛡 Exceptions", b"exc")],
+        [Button.inline("🛡 Exceptions", b"exc"), Button.inline("🔎 Deep scan", b"deep")],
     ]
     await show(event, text, buttons)
 
@@ -927,6 +965,11 @@ async def unhide_all(event):
     HIDDEN.clear()
     await db.hidden.delete_many({})
     await add_screen(event)
+
+
+async def start_deep_scan(event):
+    asyncio.create_task(deep_scan_all("manual"))
+    await show(event, b("🔎 Deep scan started. It can take a while; the result comes in the log channel."), [MENU_BTN])
 
 
 async def start_scan(event):
@@ -1218,6 +1261,8 @@ async def on_callback(event):
         await export_list(event)
     elif data == "scan":
         await start_scan(event)
+    elif data == "deep":
+        await start_deep_scan(event)
     elif data == "add":
         await add_screen(event)
     elif data == "remove":
@@ -1280,6 +1325,16 @@ async def scan_loop():
             log.warning("scan failed: %s", e)
 
 
+async def deep_scan_loop():
+    await asyncio.sleep(90)
+    while True:
+        try:
+            await deep_scan_all("auto")
+        except Exception as e:
+            log.warning("deep scan failed: %s", e)
+        await asyncio.sleep(DEEP_SCAN_HOURS * 3600)
+
+
 async def report_loop():
     while True:
         await asyncio.sleep(24 * 3600)
@@ -1337,6 +1392,8 @@ async def main():
     asyncio.create_task(startup_prep())
     asyncio.create_task(preban_worker())
     asyncio.create_task(svc_flush_loop())
+    if DEEP_SCAN_HOURS > 0:
+        asyncio.create_task(deep_scan_loop())
     asyncio.create_task(refresh_loop())
     asyncio.create_task(pending_loop())
     asyncio.create_task(report_loop())
