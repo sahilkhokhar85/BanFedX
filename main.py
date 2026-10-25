@@ -400,27 +400,46 @@ async def scan_chat(entity):
     return checked, banned, declined
 
 
+SEARCH_KEYS = "abcdefghijklmnopqrstuvwxyz0123456789"
+
+
 async def deep_scan_chat(entity) -> int:
     """Learn access hashes of listed users so they can be pre-banned in EVERY chat:
     1) from the chat's Removed list (people already banned here), 2) from a letter-by-letter member search
-    that gets around Telegram's 200-member cap for accounts with a name or username."""
+    (a-z, 0-9) that gets around Telegram's 200-member cap for accounts with a name or username.
+    Each part runs on its own, so a problem in one never stops the other."""
     banned = 0
     lines = []
     try:
         async for u in user.iter_participants(entity, filter=types.ChannelParticipantsKicked, limit=3000):
             remember(u)
-        async for u in user.iter_participants(entity, aggressive=True):
-            remember(u)
-            if is_target(entity, u.id):
-                if await ban(entity, u) == "ok":
-                    banned += 1
-                    lines.append("• " + label(u))
-                await asyncio.sleep(RATE_DELAY)
     except errors.FloodWaitError as e:
         if e.seconds <= 300:
             await asyncio.sleep(e.seconds + 1)
     except Exception as e:
-        warn_once(("deep", entity.id), b(f"⚠️ {entity.title}: deep scan failed ({type(e).__name__})"))
+        warn_once(("deep-k", entity.id), b(f"⚠️ {entity.title}: deep scan (removed list) failed: {type(e).__name__} {str(e)[:80]}"))
+
+    seen = set()
+    for q in SEARCH_KEYS:
+        try:
+            async for u in user.iter_participants(entity, search=q, limit=200):
+                if u.id in seen:
+                    continue
+                seen.add(u.id)
+                remember(u)
+                if is_target(entity, u.id):
+                    if await ban(entity, u) == "ok":
+                        banned += 1
+                        lines.append("• " + label(u))
+                    await asyncio.sleep(RATE_DELAY)
+        except errors.FloodWaitError as e:
+            if e.seconds > 300:
+                break
+            await asyncio.sleep(e.seconds + 1)
+        except Exception as e:
+            warn_once(("deep-m", entity.id), b(f"⚠️ {entity.title}: deep scan (member search) failed: {type(e).__name__} {str(e)[:80]}"))
+            break
+        await asyncio.sleep(0.4)
     if banned:
         await bump("bans", banned)
     await send_log_lines(b(f"🚫 Banned by deep scan - {entity.title}:"), lines)
