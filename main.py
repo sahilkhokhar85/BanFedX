@@ -833,6 +833,7 @@ async def menu(event):
         [Button.inline("📋 Chats", b"chats"), Button.inline("📊 Stats", b"stats")],
         [Button.inline("🔍 Scan now", b"scan"), Button.inline("📄 Banned list", b"list")],
         [Button.inline("🛡 Exceptions", b"exc"), Button.inline("🔎 Deep scan", b"deep")],
+        [Button.inline("❓ Not banned yet", b"waiting")],
     ]
     await show(event, text, buttons)
 
@@ -847,6 +848,7 @@ def stats_text(s: dict) -> str:
         ("Unbans", str(s.get("unbans", 0))),
         ("Exceptions", str(sum(len(v) for v in EXEMPT.values()))),
         ("Pre-bannable IDs", f"{sum(1 for i in HASHES if i in BANNED)}/{len(BANNED)}"),
+        ("Not banned yet", str(len(waiting_ids()))),
         ("Join/leave msgs deleted", str(s.get("svc", 0))),
         ("Last scan", last_scan_text()),
         ("Uptime", f"{up // 60}h {up % 60}m"),
@@ -866,6 +868,44 @@ async def list_screen(event):
     rows = [d["_id"] async for d in db.banned.find().sort("added_at", -1).limit(50)]
     text = b(f"📄 Banned list: {len(BANNED)} IDs in total (showing last 50)") + "\n" + "\n".join(code(i) for i in rows)
     await show(event, text, [[Button.inline("📥 Export all", b"export")], MENU_BTN])
+
+
+def waiting_ids() -> list:
+    """IDs on the list that are known to nobody (no stored hash) and are not banned in any chat yet."""
+    done_users = {u for (_, u) in DONE}
+    return sorted(i for i in BANNED if i not in HASHES and i not in SEEN and i not in done_users)
+
+
+async def waiting_screen(event, page: int = 0):
+    ids = waiting_ids()
+    if not ids:
+        text = b("✅ Every ID on the list is known to the account or is already banned somewhere.")
+        return await show(event, text, [MENU_BTN])
+    chunk, page, pages = paginate(ids, page, 20)
+    docs = {d["_id"]: d async for d in db.banned.find({"_id": {"$in": chunk}}, {"username": 1})}
+    lines = []
+    for i in chunk:
+        uname = docs.get(i, {}).get("username")
+        lines.append(code(i) + (" " + b("@" + uname) if uname else ""))
+    head = b(f"❓ Not banned yet: {len(ids)} ID(s)" + (f"  (page {page + 1}/{pages})" if pages > 1 else ""))
+    note = b("Nobody can find these on Telegram yet. They are banned the moment they send a join request, join, or show up in a scan. To ban one now, send /ban with the ID and its @username.")
+    buttons = []
+    nav = nav_row(page, pages, "wt")
+    if nav:
+        buttons.append(nav)
+    buttons += [[Button.inline("📥 Export list", b"wtexp")], MENU_BTN]
+    await show(event, "\n".join([head] + lines + ["", note]), buttons)
+
+
+async def export_waiting(event):
+    ids = waiting_ids()
+    if not ids:
+        return await show(event, b("The list is empty."), [MENU_BTN])
+    docs = {d["_id"]: d async for d in db.banned.find({"_id": {"$in": ids}}, {"username": 1})}
+    rows = [f"{i} @{docs[i]['username']}" if docs.get(i, {}).get("username") else str(i) for i in ids]
+    f = io.BytesIO("\n".join(rows).encode())
+    f.name = "not_banned_yet.txt"
+    await bot.send_file(event.chat_id, f, caption=b(f"📥 Not banned yet: {len(ids)} IDs"), parse_mode="html", buttons=[MENU_BTN])
 
 
 async def export_list(event):
@@ -893,10 +933,10 @@ def nav_row(page: int, pages: int, prefix: str) -> list:
     return row
 
 
-def paginate(items: list, page: int):
-    pages = max(1, -(-len(items) // PAGE))
+def paginate(items: list, page: int, per: int = PAGE):
+    pages = max(1, -(-len(items) // per))
     page = max(0, min(page, pages - 1))
-    return items[page * PAGE:(page + 1) * PAGE], page, pages
+    return items[page * per:(page + 1) * per], page, pages
 
 
 async def chats_screen(event, page: int = 0):
@@ -1250,6 +1290,8 @@ async def on_command(event):
         await stats_screen(event)
     elif cmd == "export":
         await export_list(event)
+    elif cmd in ("waiting", "notbanned"):
+        await waiting_screen(event)
     elif cmd in ("exceptions", "exc"):
         await exc_chats_screen(event)
     elif cmd == "scan":
@@ -1282,6 +1324,12 @@ async def on_callback(event):
         await start_scan(event)
     elif data == "deep":
         await start_deep_scan(event)
+    elif data == "waiting":
+        await waiting_screen(event)
+    elif data.startswith("wt:"):
+        await waiting_screen(event, int(data[3:]))
+    elif data == "wtexp":
+        await export_waiting(event)
     elif data == "add":
         await add_screen(event)
     elif data == "remove":
