@@ -488,7 +488,8 @@ def why_cannot() -> str:
 
 async def ent_label(uid: int) -> str:
     try:
-        ref = types.InputPeerUser(uid, HASHES[uid]) if uid in HASHES else uid
+        h = HASHES.get(uid) or SEEN.get(uid)
+        ref = types.InputPeerUser(uid, h) if h else uid
         return label(await user.get_entity(ref))
     except Exception:
         return code(uid)
@@ -658,23 +659,48 @@ async def startup_prep():
 
 
 async def unban_ids(ids):
-    idset = set(ids)
-    total = 0
-    for ent in list(MODERATED.values()):
-        lines = []
-        try:
-            async for u in user.iter_participants(ent, filter=types.ChannelParticipantsKicked):
-                if u.id in idset:
-                    await user(functions.channels.EditBannedRequest(ent, u, NO_BAN))
-                    lines.append("• " + label(u))
-                    await asyncio.sleep(RATE_DELAY)
-        except Exception as e:
-            warn_once(("unban", ent.id), b(f"⚠️ {ent.title}: could not read banned list ({type(e).__name__})"))
-        total += len(lines)
-        await send_log_lines(b(f"✅ Unbanned - {ent.title}:"), lines)
-    if total:
-        await bump("unbans", total)
-    await send_log(b(f"✅ Unban finished: {total} user(s) unbanned"))
+    """Lift the ban in every active chat. Known users (stored hash) are unbanned directly, fast and in parallel;
+    unknown ones are looked up in each chat's Removed list. Anyone put back on the ban list meanwhile is skipped,
+    so '/unban' followed by '/ban' never fights itself."""
+    chats = list(MODERATED.values())
+    known = {i: (HASHES.get(i) or SEEN.get(i)) for i in ids if HASHES.get(i) or SEEN.get(i)}
+    unknown = [i for i in ids if i not in known]
+    sem = asyncio.Semaphore(4)
+
+    async def lift(ent, uid, h):
+        if uid in BANNED:
+            return False  # put back on the ban list in the meantime
+        async with sem:
+            try:
+                await user(functions.channels.EditBannedRequest(ent, types.InputPeerUser(uid, h), NO_BAN))
+                await asyncio.sleep(0.2)
+                return True
+            except errors.FloodWaitError as e:
+                await asyncio.sleep(min(e.seconds, 60) + 1)
+            except Exception:
+                pass
+            return False
+
+    for uid, h in known.items():
+        results = await asyncio.gather(*(lift(ent, uid, h) for ent in chats))
+        n = sum(results)
+        await send_log(f"{b('✅ Unban sent:')} {await ent_label(uid)} {b(f'in {n} chat(s)')}")
+
+    if unknown:
+        idset = set(unknown)
+        for ent in chats:
+            lines = []
+            try:
+                async for u in user.iter_participants(ent, filter=types.ChannelParticipantsKicked):
+                    if u.id in idset and u.id not in BANNED:
+                        await user(functions.channels.EditBannedRequest(ent, u, NO_BAN))
+                        lines.append("• " + label(u))
+                        await asyncio.sleep(RATE_DELAY)
+            except Exception as e:
+                warn_once(("unban", ent.id), b(f"⚠️ {ent.title}: could not read banned list ({type(e).__name__})"))
+            await send_log_lines(b(f"✅ Unbanned - {ent.title}:"), lines)
+    await bump("unbans", len(ids))
+    await send_log(b(f"✅ Unban finished: {len(ids)} user(s)"))
 
 
 # ======================= engine: live events =======================
@@ -1051,7 +1077,7 @@ async def do_ban(event, ids, names=None):
     names = {i: u for i, u in (names or {}).items() if i in ids}
     new = [i for i in ids if i not in BANNED]
     already = [i for i in ids if i in BANNED]
-    retry = [i for i in already if i in names]  # already listed, but a username was given: try again now
+    retry = list(already)  # already listed: ban them again in every chat right now (no unban needed)
     more_btn = [[Button.inline("🚫 Ban more", b"ban")], MENU_BTN]
 
     parts = []
@@ -1060,12 +1086,7 @@ async def do_ban(event, ids, names=None):
     if already:
         shown = " ".join(code(i) for i in already[:10])
         more = b(f" +{len(already) - 10} more") if len(already) > 10 else ""
-        parts.append(b(f"ℹ️ {len(already)} already in the list:") + "\n" + shown + more)
-    if retry:
-        parts.append(b(f"🔁 Using the username to ban {len(retry)} listed ID(s) now."))
-    if not new and not retry:
-        parts.append(b("Nothing to add. The automatic scan keeps checking them."))
-        return await show(event, "\n\n".join(parts), more_btn)
+        parts.append(b(f"🔁 {len(already)} already in the list - banning them again in all chats now:") + "\n" + shown + more)
 
     sender = await event.get_sender()
     if new:
@@ -1085,12 +1106,16 @@ async def do_ban(event, ids, names=None):
     await show(event, "\n\n".join(parts), more_btn)
 
     targets = new + retry
+    if retry:  # force: forget what we think is done, so every chat is tried again
+        rs = set(retry)
+        DONE.difference_update({p for p in DONE if p[1] in rs})
+        await db.done.delete_many({"user": {"$in": retry}})
 
     async def job():
         notes = await resolve_now(names) if names else []  # look usernames up first, so the ban can use them
         if notes:
             await send_log_lines(b("🔎 Username lookup:"), notes)
-        ok, failed = await ban_ids(targets)
+        ok, failed = await ban_ids(targets, detail=len(targets) <= 3)
         pending = sorted(i for i in failed if i not in HASHES)
         text = b(f"✅ Ban finished: {ok} ban(s) done")
         if pending:
@@ -1120,7 +1145,10 @@ async def do_unban(event, ids):
     BANNED.difference_update(ids)
     DONE.difference_update({p for p in DONE if p[1] in set(ids)})
     for i in ids:
-        HASHES.pop(i, None)
+        h = HASHES.pop(i, None)
+        if h:  # keep the pehchan: he can be banned again at once later
+            SEEN[i] = h
+            asyncio.create_task(db.seen.update_one({"_id": i}, {"$set": {"hash": h}}, upsert=True))
     await send_log(f"{b('📝 Unban command:')} {label(sender)} {b(f'- {len(ids)} ID(s)')}")
     await show(event, b(f"✅ {len(ids)} ID(s) removed from the list. Unbanning in progress, results in the log channel."), [[Button.inline("✅ Unban more", b"unban")], MENU_BTN])
     asyncio.create_task(unban_ids(ids))
